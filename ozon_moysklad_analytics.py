@@ -407,14 +407,51 @@ if run:
                 "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
                 "ordered_revenue", "ms_name", "stock", "cost_missing", "has_finance",
             ]
-            st.dataframe(report[[col for col in display_columns if col in report]].sort_values("sales_revenue", ascending=False), use_container_width=True, height=500)
+            column_names_ru = {
+                "offer_id": "Артикул",
+                "name": "Название товара",
+                "sku": "SKU Ozon",
+                "sales_revenue": "Продажи по начислениям, ₽",
+                "bonus_amount": "Баллы Ozon, ₽",
+                "partner_programs": "Программы партнёров, ₽",
+                "sale_commission": "Вознаграждение Ozon, ₽",
+                "delivery_fees": "Доставка и логистика, ₽",
+                "item_fees": "Дополнительные услуги и штрафы, ₽",
+                "delivered_units": "Доставлено, шт.",
+                "returned_units": "Возвращено, шт.",
+                "net_units": "Продано за вычетом возвратов, шт.",
+                "cost_price": "Себестоимость за единицу, ₽",
+                "cost_total": "Себестоимость за период, ₽",
+                "margin_pct": "Доля от продаж, %",
+                "profit_per_unit": "Прибыль за единицу, ₽",
+                "profit_period": "Прибыль за период, ₽",
+                "ordered_revenue": "Заказано на сумму, ₽",
+                "ordered_units": "Заказано, шт.",
+                "ms_name": "Название в МойСклад",
+                "ms_code": "Код в МойСклад",
+                "stock": "Остаток, шт.",
+                "cost_missing": "Себестоимость не найдена",
+                "has_finance": "Начисления найдены",
+                "revenue_total": "Продажи с баллами и программами, ₽",
+                "ozon_fees": "Расходы Ozon, ₽",
+                "seller_price_fallback": "Цена продавца из начислений, ₽",
+                "date": "Дата",
+                "accrued_category": "Категория начисления",
+                "type_id": "Код типа операции",
+                "unit_number": "Номер отправления или операции",
+                "amount": "Сумма, ₽",
+                "currency": "Валюта",
+            }
+            table = report[[col for col in display_columns if col in report]].sort_values("sales_revenue", ascending=False)
+            st.dataframe(table.rename(columns=column_names_ru), use_container_width=True, height=500)
             if not accruals.empty:
                 with st.expander("Финансовые операции Ozon"):
-                    st.dataframe(accruals, use_container_width=True)
+                    st.dataframe(accruals.rename(columns=column_names_ru), use_container_width=True)
             if not unallocated_fees.empty:
                 with st.expander("Начисления без привязки к товару"):
-                    st.dataframe(unallocated_fees, use_container_width=True)
-            st.download_button("Скачать CSV", report.drop(columns=["_merge"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), "ozon_moysklad_analytics.csv", "text/csv")
+                    st.dataframe(unallocated_fees.rename(columns=column_names_ru), use_container_width=True)
+            csv_report = report.drop(columns=["_merge"], errors="ignore").rename(columns=column_names_ru)
+            st.download_button("Скачать CSV", csv_report.to_csv(index=False).encode("utf-8-sig"), "ozon_moysklad_analytics.csv", "text/csv")
         except (RuntimeError, ValueError, requests.RequestException) as exc:
             st.error(f"Не удалось собрать отчёт: {exc}")
         except Exception as exc:
