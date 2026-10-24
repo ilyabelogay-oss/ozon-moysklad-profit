@@ -235,6 +235,7 @@ def fetch_ozon_accruals(
     return accruals, sku_finance, unallocated
 
 
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def fetch_moysklad_costs(token: str) -> pd.DataFrame:
     headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
     # Average the unit prices from all posted receipts and inventory receipts.
@@ -315,7 +316,15 @@ with st.sidebar:
     default_start = default_end - timedelta(days=30)
     date_from = st.date_input("С", default_start)
     date_to = st.date_input("По", default_end)
-    run = st.button("Собрать аналитику", type="primary", use_container_width=True)
+    run_report = st.button("Собрать аналитику", type="primary", use_container_width=True)
+    refresh_costs = st.button(
+        "Обновить себестоимость",
+        use_container_width=True,
+        help="Заново загрузить историю приёмок и оприходований из МоегоСклада.",
+    )
+    if refresh_costs:
+        fetch_moysklad_costs.clear()
+    run = run_report or refresh_costs
 
 if run:
     if not all((client_id, api_key, ms_token)):
