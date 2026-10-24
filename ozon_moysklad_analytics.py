@@ -416,24 +416,23 @@ if run:
             ).where(report["profit_period"] > 0).round(2)
 
             profit_rows = report["profit_period"].notna()
-            finance_report = report.loc[report["has_finance"]]
-            sales_total = float(finance_report["sales_revenue"].sum())
-            bonus_total = float(finance_report["bonus_amount"].sum())
-            partner_total = float(finance_report["partner_programs"].sum())
-            delivered_total = float(finance_report["delivered_units"].sum())
-            returns_total = float(finance_report["returned_units"].sum())
+            covered = report.loc[profit_rows]
+            sales_total = float(covered["sales_revenue"].sum())
+            bonus_total = float(covered["bonus_amount"].sum())
+            partner_total = float(covered["partner_programs"].sum())
+            delivered_total = float(covered["delivered_units"].sum())
+            returns_total = float(covered["returned_units"].sum())
             cost_total = float(report.loc[profit_rows, "cost_total"].sum()) if not report.empty else 0.0
-            ozon_revenue_total = float(finance_report["revenue_total"].sum())
+            matched_revenue_total = float(covered["revenue_total"].sum())
             unmatched = int(report["cost_missing"].sum()) if not report.empty else 0
             finance_missing = int((~report["has_finance"]).sum()) if not report.empty else 0
             non_item_total = float(pd.to_numeric(unallocated_fees.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-            ozon_fees_total = float(finance_report["ozon_fees"].sum())
-            # First reconcile the whole account to Ozon's net accrual, including
-            # fees without an SKU. Then subtract historical COGS once at the end.
-            ozon_net_total = ozon_revenue_total - ozon_fees_total + non_item_total
-            profit_total = ozon_net_total - cost_total
-            margin_total = (profit_total / ozon_revenue_total * 100
-                            if profit_total > 0 and ozon_revenue_total > 0 else None)
+            # Each SKU's profit_period already subtracts its own Ozon fees and
+            # historical COGS. Add only unallocated fees at the account level.
+            sku_profit_total = float(covered["profit_period"].sum())
+            profit_total = sku_profit_total + non_item_total
+            margin_total = (profit_total / matched_revenue_total * 100
+                            if profit_total > 0 and matched_revenue_total > 0 else None)
             progress.progress(100, text="Готово")
 
             if more_sales:
@@ -458,7 +457,7 @@ if run:
             d.metric("Себестоимость", f"{cost_total:,.2f} ₽")
             e.metric("Прибыль за период", f"{profit_total:,.2f} ₽" if accruals_loaded else "нет данных")
             f.metric("Доля от продаж", f"{margin_total:.2f}%" if margin_total is not None else "—")
-            st.caption(f"Общая прибыль = итог начислений Ozon ({ozon_net_total:,.2f} ₽) − найденная историческая себестоимость проданных товаров ({cost_total:,.2f} ₽). По товарам себестоимость найдена для {int(profit_rows.sum())} из {len(report)} строк. Программы партнёров: {partner_total:,.2f} ₽ · Нераспределённые начисления без SKU: {non_item_total:,.2f} ₽; они учтены в итоге Ozon, но не распределены по товарам.")
+            st.caption(f"Прибыль считается по каждой строке товара: выручка + баллы + программы партнёров − расходы Ozon − себестоимость. Сводный итог — сумма прибыли по {int(profit_rows.sum())} SKU с найденной себестоимостью и начислениями, плюс нераспределённые начисления {non_item_total:,.2f} ₽; их нельзя отнести к конкретным товарам.")
 
             st.subheader("Юнит-экономика по товарам")
             display_columns = [
