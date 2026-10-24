@@ -9,8 +9,92 @@ MOYSKLAD_URL = "https://api.moysklad.ru/api/remap/1.2"
 REQUEST_TIMEOUT = 60
 
 st.set_page_config(page_title="Юнит-экономика Ozon + МойСклад", layout="wide", page_icon="📊")
-st.title("Юнит-экономика Ozon с себестоимостью МоегоСклада")
-st.caption("Загрузите XLSX-выгрузку юнит-экономики Ozon. Приложение добавит историческую средневзвешенную себестоимость по коду товара и пересчитает прибыль.")
+st.markdown(
+    """
+    <style>
+    :root {
+        --xr-red: #ed3946;
+        --xr-red-soft: rgba(237, 57, 70, .13);
+        --xr-panel: rgba(30, 32, 39, .82);
+        --xr-line: rgba(255, 255, 255, .09);
+        --xr-muted: #a5a8b2;
+    }
+    [data-testid="stAppViewContainer"] {
+        background:
+            radial-gradient(ellipse at 82% 0%, rgba(237, 57, 70, .10), transparent 32%),
+            linear-gradient(145deg, #111216 0%, #17191f 55%, #111216 100%);
+    }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stMainBlockContainer"] { max-width: 1550px; padding-top: 2rem; }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1b1d23 0%, #15161b 100%);
+        border-right: 1px solid var(--xr-line);
+    }
+    h1, h2, h3 { letter-spacing: -.035em; }
+    h1 { font-size: clamp(1.9rem, 3vw, 2.75rem) !important; font-weight: 760 !important; }
+    [data-testid="stCaptionContainer"] { color: var(--xr-muted); }
+    [data-testid="stMetric"] {
+        background: var(--xr-panel);
+        border: 1px solid var(--xr-line);
+        border-radius: 16px;
+        padding: 18px 20px;
+        min-height: 118px;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, .16);
+    }
+    [data-testid="stMetricLabel"] { color: var(--xr-muted); }
+    [data-testid="stMetricValue"] { font-weight: 720; }
+    div.stButton > button, div.stDownloadButton > button {
+        border-radius: 10px;
+        border: 1px solid rgba(237, 57, 70, .55);
+        transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+    }
+    div.stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #f04450, #cf2634);
+        color: white;
+        border: 0;
+        box-shadow: 0 7px 20px rgba(237, 57, 70, .22);
+    }
+    div.stButton > button:hover, div.stDownloadButton > button:hover {
+        transform: translateY(-1px);
+        border-color: var(--xr-red);
+        box-shadow: 0 8px 20px rgba(237, 57, 70, .16);
+    }
+    [data-testid="stFileUploader"] section {
+        border: 1px dashed rgba(237, 57, 70, .55);
+        border-radius: 16px;
+        background: var(--xr-red-soft);
+    }
+    [data-testid="stTabs"] [role="tab"] { font-weight: 650; }
+    [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+        color: var(--xr-red);
+        border-bottom-color: var(--xr-red);
+    }
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--xr-line);
+        border-radius: 14px;
+        overflow: hidden;
+    }
+    [data-testid="stAlert"] { border-radius: 12px; }
+    .xr-kicker {
+        color: var(--xr-red);
+        text-transform: uppercase;
+        font-size: .76rem;
+        font-weight: 800;
+        letter-spacing: .17em;
+        margin: .1rem 0 .35rem;
+    }
+    .xr-subtitle { color: var(--xr-muted); font-size: 1rem; margin-top: -.35rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+brand_logo, brand_title = st.columns([1, 7])
+with brand_logo:
+    st.image("assets/x-ride-logo.jpg", width=112)
+with brand_title:
+    st.markdown('<div class="xr-kicker">X-RIDE · ANALYTICS</div>', unsafe_allow_html=True)
+    st.title("Юнит-экономика Ozon × МойСклад")
+    st.markdown('<div class="xr-subtitle">Прибыль, себестоимость и целевая цена по каждой позиции</div>', unsafe_allow_html=True)
 
 
 def get_streamlit_secret(name: str) -> str:
