@@ -445,13 +445,6 @@ if run:
             f.metric("Доля от продаж", f"{margin_total:.2f}%" if margin_total is not None else "—")
             st.caption(f"Прибыль считается по каждой строке товара: выручка + баллы + программы партнёров − расходы Ozon − себестоимость. Сводный итог — сумма прибыли по {int(profit_rows.sum())} SKU с найденной себестоимостью и начислениями, плюс нераспределённые начисления {non_item_total:,.2f} ₽; их нельзя отнести к конкретным товарам.")
 
-            st.subheader("Юнит-экономика по товарам")
-            display_columns = [
-                "offer_id", "name", "sku", "sales_revenue", "bonus_amount", "partner_programs",
-                "sale_commission", "delivery_fees", "item_fees", "delivered_units", "returned_units",
-                "ordered_units", "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
-                "ordered_revenue", "ms_name", "cost_missing", "has_finance",
-            ]
             column_names_ru = {
                 "offer_id": "Артикул",
                 "name": "Название товара",
@@ -486,16 +479,99 @@ if run:
                 "amount": "Сумма, ₽",
                 "currency": "Валюта",
             }
-            table = report[[col for col in display_columns if col in report]].sort_values("sales_revenue", ascending=False)
-            st.dataframe(table.rename(columns=column_names_ru), use_container_width=True, height=500)
-            if not accruals.empty:
-                with st.expander("Финансовые операции Ozon"):
-                    st.dataframe(accruals.rename(columns=column_names_ru), use_container_width=True)
-            if not unallocated_fees.empty:
-                with st.expander("Начисления без привязки к товару"):
-                    st.dataframe(unallocated_fees.rename(columns=column_names_ru), use_container_width=True)
-            csv_report = report.drop(columns=["_merge"], errors="ignore").rename(columns=column_names_ru)
-            st.download_button("Скачать CSV", csv_report.to_csv(index=False).encode("utf-8-sig"), "ozon_moysklad_analytics.csv", "text/csv")
+            tab_report, tab_price = st.tabs(["Юнит-экономика", "Целевая маржинальность"])
+            with tab_report:
+                st.subheader("Юнит-экономика по товарам")
+                display_columns = [
+                    "offer_id", "name", "sku", "sales_revenue", "bonus_amount", "partner_programs",
+                    "sale_commission", "delivery_fees", "item_fees", "delivered_units", "returned_units",
+                    "ordered_units", "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
+                    "ordered_revenue", "ms_name", "cost_missing", "has_finance",
+                ]
+                table = report[[col for col in display_columns if col in report]].sort_values("sales_revenue", ascending=False)
+                st.dataframe(table.rename(columns=column_names_ru), use_container_width=True, height=500)
+                if not accruals.empty:
+                    with st.expander("Финансовые операции Ozon"):
+                        st.dataframe(accruals.rename(columns=column_names_ru), use_container_width=True)
+                if not unallocated_fees.empty:
+                    with st.expander("Начисления без привязки к товару"):
+                        st.dataframe(unallocated_fees.rename(columns=column_names_ru), use_container_width=True)
+                csv_report = report.drop(columns=["_merge"], errors="ignore").rename(columns=column_names_ru)
+                st.download_button("Скачать CSV", csv_report.to_csv(index=False).encode("utf-8-sig"), "ozon_moysklad_analytics.csv", "text/csv")
+
+            with tab_price:
+                st.subheader("Расчёт цены для целевой маржинальности")
+                st.caption("Текущая цена оценивается по начислениям за выбранный период: (продажи + баллы + программы партнёров) / заказанное количество. При расчёте целевой цены комиссия Ozon считается пропорциональной цене, а логистика, услуги и себестоимость — фиксированными на единицу товара. Если текущая маржа уже не ниже цели, надбавка будет нулевой.")
+                target_margin_pct = st.number_input(
+                    "Целевая маржинальность, %",
+                    min_value=0.0,
+                    max_value=95.0,
+                    value=30.0,
+                    step=1.0,
+                    key="target_margin_pct",
+                )
+                scenario_mask = (
+                    report["has_finance"]
+                    & ~report["cost_missing"]
+                    & (report["ordered_units"] > 0)
+                    & (report["revenue_total"] > 0)
+                )
+                scenario = report.loc[scenario_mask].copy()
+                if scenario.empty:
+                    st.info("Для расчёта нужны товары с начислениями, найденной себестоимостью и положительным количеством заказов.")
+                else:
+                    scenario["current_unit_price"] = scenario["revenue_total"] / scenario["ordered_units"]
+                    scenario["commission_rate"] = (
+                        scenario["sale_commission"] / scenario["revenue_total"]
+                    ).clip(lower=0, upper=0.95)
+                    scenario["other_fees_per_unit"] = (
+                        (scenario["delivery_fees"] + scenario["item_fees"])
+                        / scenario["ordered_units"]
+                    ).clip(lower=0)
+                    target_rate = target_margin_pct / 100
+                    denominator = 1 - scenario["commission_rate"] - target_rate
+                    feasible = denominator > 0
+                    scenario["target_unit_price"] = float("nan")
+                    scenario.loc[feasible, "target_unit_price"] = (
+                        scenario.loc[feasible, "cost_price"]
+                        + scenario.loc[feasible, "other_fees_per_unit"]
+                    ) / denominator.loc[feasible]
+                    scenario["price_increase"] = (
+                        scenario["target_unit_price"] - scenario["current_unit_price"]
+                    ).clip(lower=0)
+                    scenario["recommended_unit_price"] = scenario["current_unit_price"] + scenario["price_increase"]
+                    scenario["projected_margin_pct"] = (
+                        scenario["recommended_unit_price"] * (1 - scenario["commission_rate"])
+                        - scenario["other_fees_per_unit"] - scenario["cost_price"]
+                    ) / scenario["recommended_unit_price"] * 100
+                    scenario.loc[~feasible, "projected_margin_pct"] = pd.NA
+                    scenario["target_status"] = "Рассчитано"
+                    scenario.loc[~feasible, "target_status"] = "Цель недостижима при текущей комиссии"
+
+                    scenario_columns_ru = {
+                        "offer_id": "Артикул",
+                        "name": "Название товара",
+                        "sku": "SKU Ozon",
+                        "current_unit_price": "Текущая средняя цена, ₽",
+                        "cost_price": "Себестоимость за единицу, ₽",
+                        "commission_rate": "Комиссия Ozon, %",
+                        "other_fees_per_unit": "Логистика и услуги за единицу, ₽",
+                        "target_unit_price": "Цена для целевой маржи, ₽",
+                        "price_increase": "Добавить к цене, ₽",
+                        "recommended_unit_price": "Расчётная цена, ₽",
+                        "projected_margin_pct": "Маржинальность после изменения, %",
+                        "target_status": "Результат",
+                    }
+                    scenario["commission_rate"] *= 100
+                    scenario_view = scenario[[*scenario_columns_ru]].rename(columns=scenario_columns_ru)
+                    scenario_view = scenario_view.sort_values("Добавить к цене, ₽", ascending=False, na_position="last")
+                    st.dataframe(scenario_view, use_container_width=True, height=500)
+                    st.download_button(
+                        "Скачать расчёт цен CSV",
+                        scenario_view.to_csv(index=False).encode("utf-8-sig"),
+                        "ozon_target_margin_prices.csv",
+                        "text/csv",
+                    )
         except (RuntimeError, ValueError, requests.RequestException) as exc:
             st.error(f"Не удалось собрать отчёт: {exc}")
         except Exception as exc:
