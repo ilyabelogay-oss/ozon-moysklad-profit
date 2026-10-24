@@ -380,13 +380,13 @@ if run:
             report["net_units"] = report["delivered_units"] - report["returned_units"]
             report["revenue_total"] = report["sales_revenue"] + report["bonus_amount"] + report["partner_programs"]
             report["ozon_fees"] = report["sale_commission"] + report["delivery_fees"] + report["item_fees"]
-            # Historical unit cost times net delivered quantity, calculated per SKU.
-            report["cost_total"] = report["cost_price"] * report["net_units"]
+            # Historical unit cost times ordered quantity, calculated per SKU.
+            report["cost_total"] = report["cost_price"] * report["ordered_units"]
             report["profit_period"] = (
                 report["revenue_total"] - report["ozon_fees"] - report["cost_total"]
-            ).where(report["has_finance"] & ~report["cost_missing"] & report["net_units"].notna())
+            ).where(report["has_finance"] & ~report["cost_missing"] & report["ordered_units"].notna())
             report["profit_per_unit"] = report["profit_period"].div(
-                report["net_units"].where(report["net_units"] > 0)
+                report["ordered_units"].where(report["ordered_units"] > 0)
             ).where(report["profit_period"].notna()).fillna(0).round(4)
             report["margin_pct"] = (
                 report["profit_period"].div(report["revenue_total"].where(report["revenue_total"] > 0)) * 100
@@ -419,8 +419,8 @@ if run:
             if finance_missing:
                 st.warning(f"По {finance_missing} товарам нет начислений Ozon за выбранный период; их прибыль не рассчитывается.")
             if not units_available:
-                st.warning("План Ozon API не вернул показатели доставленных и возвращённых товаров. Выручку по заказам можно посмотреть, но прибыль по формуле юнит-экономики не рассчитана.")
-            st.info("Формула: выручка + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − историческая средняя себестоимость × (доставлено − возвращено). Баллы и программы партнёров не дублируются в выручке; нераспределённые начисления учитываются в общей прибыли, но не распределяются по товарам.")
+                st.warning("План Ozon API не вернул количество доставленных и возвращённых товаров. Себестоимость и прибыль рассчитываются по заказанному количеству.")
+            st.info("По каждой позиции: себестоимость периода = историческая средняя себестоимость за единицу × заказанное количество; прибыль периода = выручка + баллы + программы партнёров − расходы Ozon − себестоимость периода.")
             if not accruals_loaded:
                 message = "Финансовые операции не получены. Прибыль и маржинальность не рассчитываются."
                 if accrual_error:
@@ -440,7 +440,7 @@ if run:
             display_columns = [
                 "offer_id", "name", "sku", "sales_revenue", "bonus_amount", "partner_programs",
                 "sale_commission", "delivery_fees", "item_fees", "delivered_units", "returned_units",
-                "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
+                "ordered_units", "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
                 "ordered_revenue", "ms_name", "cost_missing", "has_finance",
             ]
             column_names_ru = {
@@ -457,7 +457,7 @@ if run:
                 "returned_units": "Возвращено, шт.",
                 "net_units": "Продано за вычетом возвратов, шт.",
                 "cost_price": "Историческая средняя себестоимость, ₽",
-                "cost_total": "Себестоимость за период, ₽",
+                "cost_total": "Себестоимость заказанного количества, ₽",
                 "margin_pct": "Доля от продаж, %",
                 "profit_per_unit": "Прибыль за единицу, ₽",
                 "profit_period": "Прибыль за период, ₽",
@@ -493,4 +493,4 @@ if run:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
 
 st.markdown("---")
-st.caption("Юнит-экономика по каждому SKU: прибыль за период = продажи + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − историческая себестоимость за единицу × (доставлено − возвращено). Доля от продаж = прибыль за период / (продажи + баллы + программы партнёров). Для убыточных товаров доля не показывается, как в исходной выгрузке.")
+st.caption("Юнит-экономика по каждому SKU: себестоимость за период = историческая средняя себестоимость за единицу × заказанное количество. Прибыль за период = продажи + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − себестоимость за период. Прибыль за единицу = прибыль за период / заказанное количество.")
