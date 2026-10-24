@@ -66,6 +66,7 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
     # Prices in MoySklad document positions are in kopecks, and quantity-weighting
     # avoids treating a one-unit purchase like a large replenishment.
     history_rows = []
+    source_names = {"supply": "supply", "enter": "enter"}
     for entity in ("supply", "enter"):
         offset = 0
         while True:
@@ -96,6 +97,7 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
                     history_rows.append({
                         "ms_code": str(code).strip(),
                         "ms_name": assortment.get("name", ""),
+                        "source": source_names[entity],
                         "receipt_value": float(price) * float(quantity) / 100,
                         "receipt_quantity": float(quantity),
                     })
@@ -105,15 +107,34 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
 
     history = pd.DataFrame(history_rows)
     if history.empty:
-        costs = pd.DataFrame(columns=["ms_code", "ms_name", "cost_price"])
+        costs = pd.DataFrame(columns=[
+            "ms_code", "ms_name", "cost_price", "cost_supply", "quantity_supply",
+            "cost_enter", "quantity_enter",
+        ])
     else:
-        costs = history.groupby("ms_code", as_index=False).agg(
+        by_source = history.groupby(["ms_code", "source"], as_index=False).agg(
             ms_name=("ms_name", "first"),
             receipt_value=("receipt_value", "sum"),
             receipt_quantity=("receipt_quantity", "sum"),
         )
-        costs["cost_price"] = costs["receipt_value"] / costs["receipt_quantity"]
-        costs = costs.drop(columns=["receipt_value", "receipt_quantity"])
+        by_source["source_cost"] = by_source["receipt_value"] / by_source["receipt_quantity"]
+        by_source["source_quantity"] = by_source["receipt_quantity"]
+        pivot = by_source.pivot(index="ms_code", columns="source", values=["source_cost", "source_quantity"])
+        pivot.columns = [f"{metric}_{source}" for metric, source in pivot.columns]
+        source_summary = pivot.reset_index()
+        totals = history.groupby("ms_code", as_index=False).agg(
+            ms_name=("ms_name", "first"),
+            receipt_value=("receipt_value", "sum"),
+            receipt_quantity=("receipt_quantity", "sum"),
+        )
+        totals["cost_price"] = totals["receipt_value"] / totals["receipt_quantity"]
+        costs = totals[["ms_code", "ms_name", "cost_price"]].merge(source_summary, on="ms_code", how="left")
+        costs = costs.rename(columns={
+            "source_cost_supply": "cost_supply",
+            "source_quantity_supply": "quantity_supply",
+            "source_cost_enter": "cost_enter",
+            "source_quantity_enter": "quantity_enter",
+        })
 
     return costs
 
@@ -262,6 +283,10 @@ elif run:
                 "sku": "SKU Ozon", "offer_id": "Артикул", "name": "Название товара",
                 "scheme": "Схема работы", "ozon_cost_price": "Себестоимость из выгрузки, ₽",
                 "cost_price": "Историческая себестоимость МоегоСклада, ₽",
+                "cost_supply": "Средняя цена по приёмкам, ₽",
+                "quantity_supply": "Количество в приёмках, шт.",
+                "cost_enter": "Средняя цена по оприходованиям, ₽",
+                "quantity_enter": "Количество в оприходованиях, шт.",
                 "cost_total": "Себестоимость доставленных товаров за вычетом возвратов, ₽",
                 "net_units": "Доставлено минус возвращено, шт.",
                 "price": "Текущая цена, ₽", "sent_to_delivery": "Передано в доставку, шт.",
