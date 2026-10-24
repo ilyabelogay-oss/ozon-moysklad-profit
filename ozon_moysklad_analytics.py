@@ -281,7 +281,7 @@ elif run:
                 st.dataframe(display_report, use_container_width=True, height=520)
                 st.download_button(
                     "Скачать расчёт CSV",
-                    display_report.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                    display_report.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
                     "ozon_moysklad_unit_economics.csv",
                     "text/csv",
                 )
@@ -327,9 +327,20 @@ elif run:
                         "price_increase": "Добавить к цене, ₽", "recommended_price": "Рекомендуемая цена, ₽",
                         "projected_margin": "Маржинальность после изменения, %",
                     }).sort_values("Добавить к цене, ₽", ascending=False)
-                    st.dataframe(scenario_view, use_container_width=True, height=500)
+                    quantity_columns = [
+                        "Передано покупателям, шт.", "Доставлено, шт.", "Возвращено, шт.",
+                    ]
+                    scenario_view[quantity_columns] = scenario_view[quantity_columns].astype(float)
+                    quantity_format = {
+                        column: st.column_config.NumberColumn(format="%.1f")
+                        for column in quantity_columns
+                    }
+                    st.dataframe(
+                        scenario_view, column_config=quantity_format,
+                        use_container_width=True, height=500,
+                    )
                     st.download_button(
-                        "Скачать расчёт цен CSV", scenario_view.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                        "Скачать расчёт цен CSV", scenario_view.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
                         "ozon_target_margin_prices.csv", "text/csv",
                     )
         except (RuntimeError, ValueError, requests.RequestException, ImportError) as exc:
