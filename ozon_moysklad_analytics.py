@@ -327,7 +327,9 @@ with st.sidebar:
     )
     if refresh_costs:
         fetch_moysklad_costs.clear()
-    run = run_report or refresh_costs
+    if run_report or refresh_costs:
+        st.session_state["report_ready"] = True
+    run = run_report or refresh_costs or st.session_state.get("report_ready", False)
 
 if run:
     if not all((client_id, api_key, ms_token)):
@@ -506,14 +508,16 @@ if run:
             with tab_price:
                 st.subheader("Расчёт цены для целевой маржинальности")
                 st.caption("Расчёт использует текущую цену из карточки Ozon и показатель «Прибыль за единицу» из таблицы юнит-экономики. Предполагается, что надбавка к цене увеличивает и прибыль на ту же сумму: целевая маржинальность = (прибыль за единицу + надбавка) / (цена Ozon + надбавка). Если текущая маржинальность уже достигнута, надбавка будет нулевой.")
-                target_margin_pct = st.number_input(
-                    "Целевая маржинальность, %",
-                    min_value=0.0,
-                    max_value=95.0,
-                    value=30.0,
-                    step=1.0,
-                    key="target_margin_pct",
-                )
+                with st.form("target_margin_form"):
+                    target_margin_pct = st.number_input(
+                        "Целевая маржинальность, %",
+                        min_value=0.0,
+                        max_value=95.0,
+                        value=30.0,
+                        step=1.0,
+                        key="target_margin_pct",
+                    )
+                    st.form_submit_button("Пересчитать цены")
                 scenario_mask = (
                     report["has_finance"]
                     & ~report["cost_missing"]
