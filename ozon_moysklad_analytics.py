@@ -1,21 +1,16 @@
+import io
 import time
-from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
 
-OZON_URL = "https://api-seller.ozon.ru"
 MOYSKLAD_URL = "https://api.moysklad.ru/api/remap/1.2"
 REQUEST_TIMEOUT = 60
 
-st.set_page_config(page_title="Ozon + МойСклад — аналитика", layout="wide", page_icon="📊")
-st.title("Аналитика продаж Ozon и себестоимости МоегоСклада")
-st.caption("Сопоставление выполняется по offer_id Ozon и коду товара в МоемСкладе. Себестоимость — средневзвешенная по проведённым документам «Приёмка» и «Оприходование» за всю доступную историю.")
-
-
-def ozon_headers(client_id: str, api_key: str) -> dict:
-    return {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
+st.set_page_config(page_title="Юнит-экономика Ozon + МойСклад", layout="wide", page_icon="📊")
+st.title("Юнит-экономика Ozon с себестоимостью МоегоСклада")
+st.caption("Загрузите XLSX-выгрузку юнит-экономики Ozon. Приложение добавит историческую средневзвешенную себестоимость по коду товара и пересчитает прибыль.")
 
 
 def get_streamlit_secret(name: str) -> str:
@@ -62,219 +57,6 @@ def request_json(
         return response.json()
     except ValueError as exc:
         raise RuntimeError("API вернул ответ не в формате JSON.") from exc
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_ozon_sales(
-    client_id: str, api_key: str, date_from: date, date_to: date
-) -> tuple[pd.DataFrame, bool, bool]:
-    payload = {
-        "date_from": date_from.isoformat(),
-        "date_to": date_to.isoformat(),
-        "metrics": ["revenue", "ordered_units", "delivered_units", "returns"],
-        "dimension": ["sku"],
-        "limit": 1000,
-        "offset": 0,
-    }
-    units_available = True
-    try:
-        response = request_json("POST", f"{OZON_URL}/v1/analytics/data", headers=ozon_headers(client_id, api_key), payload=payload)
-    except RuntimeError as exc:
-        # Ozon restricts delivered/returned metrics for some account plans.
-        # Keep the order data, but never substitute orders for delivered units.
-        detail = str(exc).lower()
-        if not any(field in detail for field in ("delivered_units", "returns", "metric", "premium")):
-            raise
-        units_available = False
-        payload["metrics"] = ["revenue", "ordered_units"]
-        response = request_json("POST", f"{OZON_URL}/v1/analytics/data", headers=ozon_headers(client_id, api_key), payload=payload)
-    result = response.get("result") or {}
-    rows = []
-    for item in result.get("data", []):
-        dimensions = item.get("dimensions") or []
-        metrics = item.get("metrics") or []
-        if dimensions:
-            rows.append({
-                "sku": str(dimensions[0].get("id", "")),
-                "name": dimensions[0].get("name", ""),
-                # Analytics revenue is an order metric. Keep it for comparison,
-                # but use finance accruals for the unit-economics calculation.
-                "ordered_revenue": float(metrics[0]) if metrics else 0.0,
-                "ordered_units": float(metrics[1]) if len(metrics) > 1 else 0.0,
-                "delivered_units": float(metrics[2]) if units_available and len(metrics) > 2 else None,
-                "returned_units": float(metrics[3]) if units_available and len(metrics) > 3 else None,
-            })
-    # Ozon currently applies a strict request limit to this endpoint. Do not silently
-    # fetch a second page and risk turning a normal report into a rate-limit failure.
-    return (
-        pd.DataFrame(rows, columns=["sku", "name", "ordered_revenue", "ordered_units", "delivered_units", "returned_units"]),
-        bool(result.get("has_next", False)),
-        units_available,
-    )
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_ozon_sku_to_offer(client_id: str, api_key: str, skus: list[str]) -> pd.DataFrame:
-    headers = ozon_headers(client_id, api_key)
-    mapping = {}
-    numeric_skus = [int(sku) for sku in skus if sku.isdigit()]
-    for start in range(0, len(numeric_skus), 100):
-        payload = {"sku": numeric_skus[start:start + 100]}
-        response = request_json("POST", f"{OZON_URL}/v3/product/info/list", headers=headers, payload=payload)
-        for item in response.get("items", []):
-            sku = str(item.get("sku", ""))
-            offer_id = item.get("offer_id")
-            if sku and offer_id:
-                mapping[sku] = {
-                    "offer_id": str(offer_id).strip(),
-                    "price": item.get("price"),
-                }
-        if start + 100 < len(numeric_skus):
-            time.sleep(0.25)
-    return pd.DataFrame([{"sku": sku, **product} for sku, product in mapping.items()], columns=["sku", "offer_id", "price"])
-
-
-def fetch_ozon_accruals(
-    client_id: str, api_key: str, date_from: date, date_to: date
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    headers = ozon_headers(client_id, api_key)
-    rows = []
-    sku_rows = {}
-    unallocated_rows = []
-
-    def amount(value) -> float:
-        if isinstance(value, dict):
-            value = value.get("amount")
-        try:
-            return float(value or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    current_date = date_from
-    while current_date <= date_to:
-        last_id = ""
-        seen_cursors = set()
-        for _ in range(200):
-            response = request_json(
-                "POST",
-                f"{OZON_URL}/v1/finance/accrual/by-day",
-                headers=headers,
-                payload={"date": current_date.isoformat(), "last_id": last_id},
-            )
-            batch = response.get("accruals") or []
-            for item in batch:
-                total = item.get("total_amount") or {}
-                posting = item.get("posting") or {}
-                for product in posting.get("products") or []:
-                    commission = product.get("commission") or {}
-                    sku = product.get("sku")
-                    if sku is None:
-                        continue
-                    sku = str(sku)
-                    row = sku_rows.setdefault(sku, {
-                        "sku": sku, "sales_revenue": 0.0, "bonus_amount": 0.0,
-                        "partner_programs": 0.0, "sale_commission": 0.0,
-                        "delivery_fees": 0.0, "item_fees": 0.0,
-                        "seller_price_fallback": 0.0, "has_finance": True,
-                    })
-                    bonus = amount(commission.get("bonus"))
-                    partner_program = amount(commission.get("coinvestment"))
-                    # sale_amount includes the Ozon bonus and partner program
-                    # contributions in the daily finance response. Keep the
-                    # components separate so they are added only once below.
-                    row["sales_revenue"] += (
-                        amount(commission.get("sale_amount")) - bonus - partner_program
-                    )
-                    row["bonus_amount"] += bonus
-                    row["partner_programs"] += partner_program
-                    # Store expenses as positive amounts. Ozon returns charges
-                    # with a negative sign and refunds/adjustments with a positive one.
-                    row["sale_commission"] -= amount(commission.get("sale_commission"))
-                    row["seller_price_fallback"] += amount(commission.get("seller_price"))
-
-                    delivery = product.get("delivery") or {}
-                    delivery_total = delivery.get("total_accrued")
-                    if delivery_total is not None:
-                        row["delivery_fees"] -= amount(delivery_total)
-                    else:
-                        for service in delivery.get("services") or []:
-                            row["delivery_fees"] -= amount(service.get("accrued"))
-
-                # Item fees are grouped by SKU. Convert the signed Ozon accrual
-                # to expenses, keeping refunds/adjustments as negative expenses.
-                for group in (item.get("item_fees") or {}).get("fees") or []:
-                    sku = group.get("sku")
-                    if sku is None:
-                        continue
-                    sku = str(sku)
-                    row = sku_rows.setdefault(sku, {
-                        "sku": sku, "sales_revenue": 0.0, "bonus_amount": 0.0,
-                        "partner_programs": 0.0, "sale_commission": 0.0,
-                        "delivery_fees": 0.0, "item_fees": 0.0,
-                        "seller_price_fallback": 0.0, "has_finance": True,
-                    })
-                    for fee in group.get("fees") or []:
-                        row["item_fees"] -= amount(fee.get("accrued"))
-
-                non_item = item.get("non_item_fee") or {}
-                if non_item:
-                    unallocated_rows.append({
-                        "date": item.get("date") or current_date.isoformat(),
-                        "type_id": non_item.get("type_id", ""),
-                        "amount": amount(non_item.get("accrued")),
-                    })
-                rows.append({
-                    "date": item.get("date") or current_date.isoformat(),
-                    "accrued_category": item.get("accrued_category", ""),
-                    "type_id": item.get("type_id", ""),
-                    "unit_number": item.get("unit_number", ""),
-                    "amount": amount(total),
-                    "currency": total.get("currency", ""),
-                })
-            next_id = response.get("last_id") or ""
-            if not batch or not next_id:
-                break
-            if next_id == last_id or next_id in seen_cursors:
-                raise RuntimeError(f"Ozon вернул повторяющийся курсор начислений за {current_date.isoformat()}.")
-            seen_cursors.add(next_id)
-            last_id = next_id
-            time.sleep(0.25)
-        else:
-            raise RuntimeError(f"Слишком много страниц начислений за {current_date.isoformat()}.")
-        current_date += timedelta(days=1)
-        time.sleep(0.25)
-    accruals = pd.DataFrame(rows, columns=["date", "accrued_category", "type_id", "unit_number", "amount", "currency"])
-    sku_finance = pd.DataFrame(sku_rows.values())
-    if not sku_finance.empty:
-        fallback = sku_finance["sales_revenue"].eq(0) & sku_finance["seller_price_fallback"].ne(0)
-        sku_finance.loc[fallback, "sales_revenue"] = (
-            sku_finance.loc[fallback, "seller_price_fallback"]
-            - sku_finance.loc[fallback, "bonus_amount"]
-            - sku_finance.loc[fallback, "partner_programs"]
-        )
-        sku_finance = sku_finance.drop(columns=["seller_price_fallback"])
-    unallocated = pd.DataFrame(unallocated_rows, columns=["date", "type_id", "amount"])
-    return accruals, sku_finance, unallocated
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_ozon_accruals_result(
-    client_id: str, api_key: str, date_from: date, date_to: date
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str | None]:
-    try:
-        accruals, sku_finance, unallocated = fetch_ozon_accruals(
-            client_id, api_key, date_from, date_to
-        )
-        return accruals, sku_finance, unallocated, None
-    except RuntimeError as exc:
-        # Cache short-lived API failures too, so UI-only reruns do not repeat
-        # a long failing request. Clicking the report button retries immediately.
-        return (
-            pd.DataFrame(columns=["date", "accrued_category", "type_id", "unit_number", "amount", "currency"]),
-            pd.DataFrame(columns=["sku", "sales_revenue", "bonus_amount", "partner_programs", "sale_commission", "delivery_fees", "item_fees", "has_finance"]),
-            pd.DataFrame(columns=["date", "type_id", "amount"]),
-            str(exc),
-        )
 
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
@@ -336,280 +118,218 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
     return costs
 
 
-def validate_period(start: date, end: date) -> None:
-    if start > end:
-        raise ValueError("Дата начала периода позже даты окончания.")
-    if (end - start).days > 365:
-        raise ValueError("Выберите период не длиннее одного года.")
+@st.cache_data(show_spinner=False)
+def parse_unit_economics(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
+    raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine="openpyxl")
+    if raw.shape[0] < 5:
+        raise ValueError("В файле не найдена таблица юнит-экономики.")
+    period_cell = raw.iat[0, 0]
+    period_label = str(period_cell) if pd.notna(period_cell) else "Период не указан"
+    headers = [" ".join(str(value).split()) if pd.notna(value) else f"Столбец {i + 1}" for i, value in enumerate(raw.iloc[3])]
+    data = raw.iloc[4:].copy()
+    data.columns = headers
+    data = data.dropna(how="all")
+    required = [
+        "SKU", "Артикул", "Название товара", "Себестоимость", "Текущая цена",
+        "Передано в доставку покупателям, шт", "Доставлено товаров, шт",
+        "Возвращено товаров, шт", "Выручка", "Баллы за скидки",
+        "Программы партнёров", "Прибыль за период",
+    ]
+    missing = [column for column in required if column not in data.columns]
+    if missing:
+        raise ValueError("Не найдены обязательные столбцы: " + ", ".join(missing))
+    return data.reset_index(drop=True), period_label
 
 
+def normalize_code(value) -> str:
+    if pd.isna(value):
+        return ""
+    result = str(value).strip()
+    if result.endswith(".0") and result[:-2].isdigit():
+        result = result[:-2]
+    return result
+
+
+st.markdown("---")
 with st.sidebar:
-    st.header("Подключение")
-    secret_client_id = get_streamlit_secret("OZON_CLIENT_ID")
-    secret_api_key = get_streamlit_secret("OZON_API_KEY")
+    st.header("МойСклад")
     secret_ms_token = get_streamlit_secret("MOYSKLAD_TOKEN")
-    if any((secret_client_id, secret_api_key, secret_ms_token)):
-        st.caption("Секреты из настроек Streamlit используются автоматически.")
-    client_id = secret_client_id or st.text_input("Ozon Client-Id", type="password")
-    api_key = secret_api_key or st.text_input("Ozon Api-Key", type="password")
+    if secret_ms_token:
+        st.caption("Токен МоегоСклада берётся из секретов Streamlit.")
     ms_token = secret_ms_token or st.text_input("Токен МоегоСклада", type="password")
-    st.header("Период")
-    default_end = date.today()
-    default_start = default_end - timedelta(days=30)
-    date_from = st.date_input("С", default_start)
-    date_to = st.date_input("По", default_end)
-    run_report = st.button("Собрать аналитику", type="primary", use_container_width=True)
     refresh_costs = st.button(
         "Обновить себестоимость",
         use_container_width=True,
-        help="Заново загрузить историю приёмок и оприходований из МоегоСклада.",
+        help="Заново загрузить исторические приёмки и оприходования из МоегоСклада.",
     )
-    if run_report:
-        # An explicit report request refreshes Ozon data. Other Streamlit reruns,
-        # such as changing the target margin, reuse the recent API responses.
-        fetch_ozon_sales.clear()
-        fetch_ozon_sku_to_offer.clear()
-        fetch_ozon_accruals_result.clear()
-    if refresh_costs:
-        fetch_moysklad_costs.clear()
-    if run_report or refresh_costs:
-        st.session_state["report_ready"] = True
-    run = run_report or refresh_costs or st.session_state.get("report_ready", False)
 
-if run:
-    if not all((client_id, api_key, ms_token)):
-        st.error("Заполните все три ключа доступа.")
+uploaded_file = st.file_uploader(
+    "Загрузите XLSX-выгрузку «Юнит-экономика» из Ozon",
+    type=["xlsx"],
+    help="Приложение возьмёт из файла показатели продаж, начислений, цены и прибыли, а историческую себестоимость загрузит из МоегоСклада.",
+)
+run_report = st.button("Рассчитать по таблице", type="primary", disabled=uploaded_file is None)
+if refresh_costs:
+    fetch_moysklad_costs.clear()
+if run_report or refresh_costs:
+    st.session_state["report_ready"] = True
+run = st.session_state.get("report_ready", False)
+
+if not uploaded_file:
+    st.info("Загрузите XLSX-выгрузку юнит-экономики Ozon, чтобы рассчитать прибыль с исторической себестоимостью из МоегоСклада.")
+elif run:
+    if not ms_token:
+        st.error("Добавьте токен МоегоСклада в секреты Streamlit или в поле слева.")
     else:
         try:
-            validate_period(date_from, date_to)
-            progress = st.progress(0, text="Загружаем продажи Ozon…")
-            sales, more_sales, units_available = fetch_ozon_sales(client_id, api_key, date_from, date_to)
-            progress.progress(20, text="Загружаем себестоимость из МоегоСклада…")
-            costs = fetch_moysklad_costs(ms_token)
-            progress.progress(45, text="Загружаем финансовые операции Ozon…")
-            accrual_error = None
-            accruals_loaded = False
-            finance_columns = [
-                "sku", "sales_revenue", "bonus_amount", "partner_programs",
-                "sale_commission", "delivery_fees", "item_fees", "has_finance",
-            ]
-            sku_finance = pd.DataFrame(columns=finance_columns)
-            unallocated_fees = pd.DataFrame(columns=["date", "type_id", "amount"])
-            try:
-                accruals, sku_finance, unallocated_fees, accrual_error = fetch_ozon_accruals_result(
-                    client_id, api_key, date_from, date_to
-                )
-                accruals_loaded = accrual_error is None
-            except RuntimeError as exc:
-                accruals = pd.DataFrame()
-                accrual_error = str(exc)
-            progress.progress(65, text="Сопоставляем товары и себестоимость…")
-
-            sales_columns = [
-                "sku", "name", "ordered_revenue", "ordered_units",
-                "delivered_units", "returned_units",
-            ]
-            if sales.empty:
-                sales = pd.DataFrame(columns=sales_columns)
-            report = sales.merge(sku_finance, on="sku", how="outer")
-            all_skus = report["sku"].dropna().astype(str).unique().tolist()
-            mapping = fetch_ozon_sku_to_offer(client_id, api_key, all_skus) if all_skus else pd.DataFrame(columns=["sku", "offer_id", "price"])
-            report = report.merge(mapping, on="sku", how="left")
-            if not costs.empty:
-                report = report.merge(costs, left_on="offer_id", right_on="ms_code", how="left", indicator=True)
-                report["cost_missing"] = (report["_merge"] != "both") | (pd.to_numeric(report["cost_price"], errors="coerce") <= 0)
-            else:
-                for column in ("ms_code", "ms_name", "cost_price"):
+            report, period_label = parse_unit_economics(uploaded_file.getvalue())
+            progress = st.progress(15, text="Читаем выгрузку Ozon…")
+            rename_columns = {
+                "SKU": "sku",
+                "Артикул": "offer_id",
+                "Название товара": "name",
+                "Схема работы": "scheme",
+                "Себестоимость": "ozon_cost_price",
+                "Текущая цена": "price",
+                "Передано в доставку покупателям, шт": "sent_to_delivery",
+                "Доставлено товаров, шт": "delivered_units",
+                "Возвращено товаров, шт": "returned_units",
+                "Выручка": "revenue",
+                "Баллы за скидки": "discount_points",
+                "Программы партнёров": "partner_programs",
+                "Доля от продаж": "ozon_margin_pct",
+                "Прибыль за шт": "ozon_profit_per_unit",
+                "Прибыль за период": "ozon_profit_period",
+            }
+            report = report.rename(columns=rename_columns)
+            for column in (
+                "ozon_profit_per_unit", "ozon_margin_pct",
+            ):
+                if column not in report:
                     report[column] = pd.NA
-                report["cost_missing"] = True
-            report["name"] = report["name"].fillna("")
-            report["has_finance"] = report["has_finance"].fillna(False).astype(bool)
-            if units_available:
-                report[["delivered_units", "returned_units"]] = report[["delivered_units", "returned_units"]].fillna(0)
+            report["offer_id"] = report["offer_id"].map(normalize_code)
+            report["sku"] = report["sku"].map(normalize_code)
             numeric_columns = [
-                "ordered_revenue", "ordered_units", "delivered_units", "returned_units",
-                "sales_revenue", "bonus_amount", "partner_programs", "sale_commission",
-                "delivery_fees", "item_fees", "cost_price", "price",
+                "ozon_cost_price", "price", "sent_to_delivery", "delivered_units",
+                "returned_units", "revenue", "discount_points", "partner_programs",
+                "ozon_profit_per_unit", "ozon_profit_period",
             ]
             for column in numeric_columns:
-                report[column] = pd.to_numeric(report.get(column), errors="coerce")
-                if column not in ("delivered_units", "returned_units"):
-                    report[column] = report[column].fillna(0)
+                if column in report:
+                    report[column] = pd.to_numeric(report[column], errors="coerce")
+            for column in ("ozon_cost_price", "price", "sent_to_delivery", "delivered_units", "returned_units", "revenue", "discount_points", "partner_programs"):
+                report[column] = report[column].fillna(0)
 
+            progress.progress(35, text="Загружаем историческую себестоимость из МоегоСклада…")
+            costs = fetch_moysklad_costs(ms_token)
+            report = report.merge(costs, left_on="offer_id", right_on="ms_code", how="left")
+            report["cost_missing"] = pd.to_numeric(report["cost_price"], errors="coerce").isna() | (pd.to_numeric(report["cost_price"], errors="coerce") <= 0)
+            report["cost_price"] = pd.to_numeric(report["cost_price"], errors="coerce")
             report["net_units"] = report["delivered_units"] - report["returned_units"]
-            report["revenue_total"] = report["sales_revenue"] + report["bonus_amount"] + report["partner_programs"]
-            report["ozon_fees"] = report["sale_commission"] + report["delivery_fees"] + report["item_fees"]
-            # Historical unit cost times ordered quantity, calculated per SKU.
-            report["cost_total"] = report["cost_price"] * report["ordered_units"]
+            report["cost_total"] = report["cost_price"] * report["net_units"]
+            # Ozon's exported profit already includes its own cost column. Replace
+            # that cost with MoySklad's historical average using the export's
+            # delivered-minus-returned quantity basis.
+            report["profit_before_cost"] = report["ozon_profit_period"] + report["ozon_cost_price"] * report["net_units"]
             report["profit_period"] = (
-                report["revenue_total"] - report["ozon_fees"] - report["cost_total"]
-            ).where(report["has_finance"] & ~report["cost_missing"] & report["ordered_units"].notna())
+                report["profit_before_cost"] - report["cost_total"]
+            ).where(~report["cost_missing"] & report["ozon_profit_period"].notna())
             report["profit_per_unit"] = report["profit_period"].div(
-                report["ordered_units"].where(report["ordered_units"] > 0)
-            ).where(report["profit_period"].notna()).fillna(0).round(4)
+                report["net_units"].where(report["net_units"] > 0)
+            ).where(report["profit_period"].notna()).round(4)
+            revenue_base = report["revenue"] + report["discount_points"] + report["partner_programs"]
             report["margin_pct"] = (
-                report["profit_period"].div(report["revenue_total"].where(report["revenue_total"] > 0)) * 100
-            ).where(report["profit_period"] > 0).round(2)
-
-            profit_rows = report["profit_period"].notna()
-            covered = report.loc[profit_rows]
-            sales_total = float(covered["sales_revenue"].sum())
-            bonus_total = float(covered["bonus_amount"].sum())
-            partner_total = float(covered["partner_programs"].sum())
-            delivered_total = float(covered["delivered_units"].sum())
-            returns_total = float(covered["returned_units"].sum())
-            cost_total = float(report.loc[profit_rows, "cost_total"].sum()) if not report.empty else 0.0
-            matched_revenue_total = float(covered["revenue_total"].sum())
-            unmatched = int(report["cost_missing"].sum()) if not report.empty else 0
-            finance_missing = int((~report["has_finance"]).sum()) if not report.empty else 0
-            non_item_total = float(pd.to_numeric(unallocated_fees.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-            # Each SKU's profit_period already subtracts its own Ozon fees and
-            # historical COGS. Add only unallocated fees at the account level.
-            sku_profit_total = float(covered["profit_period"].sum())
-            profit_total = sku_profit_total + non_item_total
-            margin_total = (profit_total / matched_revenue_total * 100
-                            if profit_total > 0 and matched_revenue_total > 0 else None)
+                report["profit_period"].div(revenue_base.where(revenue_base > 0)) * 100
+            ).where(report["profit_period"].notna()).round(2)
             progress.progress(100, text="Готово")
 
-            if more_sales:
-                st.warning("Ozon сообщает о дополнительных страницах аналитики. Для защиты от лимита API загружена только первая страница (до 1 000 строк); итог неполный.")
-            if unmatched:
-                st.warning(f"Для {unmatched} из {len(report)} строк себестоимость не найдена или равна нулю. Прибыль по ним не рассчитывается.")
-            if finance_missing:
-                st.warning(f"По {finance_missing} товарам нет начислений Ozon за выбранный период; их прибыль не рассчитывается.")
-            if not units_available:
-                st.warning("План Ozon API не вернул количество доставленных и возвращённых товаров. Себестоимость и прибыль рассчитываются по заказанному количеству.")
-            st.info("По каждой позиции: себестоимость периода = историческая средняя себестоимость за единицу × заказанное количество; прибыль периода = выручка + баллы + программы партнёров − расходы Ozon − себестоимость периода.")
-            if not accruals_loaded:
-                message = "Финансовые операции не получены. Прибыль и маржинальность не рассчитываются."
-                if accrual_error:
-                    message += f" Причина: {accrual_error}"
-                st.info(message)
-
-            a, b, c, d, e, f = st.columns(6)
-            a.metric("Продажи по начислениям", f"{sales_total:,.2f} ₽")
-            b.metric("Баллы Ozon", f"{bonus_total:,.2f} ₽")
-            c.metric("Доставлено / возвраты", f"{delivered_total:,.0f} / {returns_total:,.0f} шт.")
-            d.metric("Себестоимость", f"{cost_total:,.2f} ₽")
-            e.metric("Прибыль за период", f"{profit_total:,.2f} ₽" if accruals_loaded else "нет данных")
-            f.metric("Доля от продаж", f"{margin_total:.2f}%" if margin_total is not None else "—")
-            st.caption(f"Прибыль считается по каждой строке товара: выручка + баллы + программы партнёров − расходы Ozon − себестоимость. Сводный итог — сумма прибыли по {int(profit_rows.sum())} SKU с найденной себестоимостью и начислениями, плюс нераспределённые начисления {non_item_total:,.2f} ₽; их нельзя отнести к конкретным товарам.")
+            missing_costs = int(report["cost_missing"].sum())
+            if missing_costs:
+                st.warning(f"Для {missing_costs} из {len(report)} товаров не найдена историческая себестоимость в МоёмСкладе. Прибыль по ним не рассчитывается.")
+            st.caption(period_label)
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Выручка", f"{report['revenue'].sum():,.2f} ₽")
+            c2.metric("Баллы и программы", f"{(report['discount_points'] + report['partner_programs']).sum():,.2f} ₽")
+            c3.metric("Себестоимость по МоемуСкладу", f"{report['cost_total'].sum(skipna=True):,.2f} ₽")
+            c4.metric("Прибыль с найденной себестоимостью", f"{report['profit_period'].sum(skipna=True):,.2f} ₽")
+            valid_profit_rows = report["profit_period"].notna()
+            margin_denominator = revenue_base.loc[valid_profit_rows].sum()
+            margin_total = report.loc[valid_profit_rows, "profit_period"].sum() / margin_denominator * 100 if margin_denominator > 0 else 0
+            c5.metric("Маржинальность", f"{margin_total:.2f}%")
+            st.info("Все продажи, начисления Ozon, цены и показатели из выгрузки. Себестоимость из выгрузки заменяется исторической средневзвешенной себестоимостью из МоегоСклада. Прибыль пересчитывается как прибыль Ozon + себестоимость из файла × (доставлено − возвращено) − себестоимость МоегоСклада × (доставлено − возвращено).")
 
             column_names_ru = {
-                "offer_id": "Артикул",
-                "price": "Цена Ozon, ₽",
-                "name": "Название товара",
-                "sku": "SKU Ozon",
-                "sales_revenue": "Продажи по начислениям, ₽",
-                "bonus_amount": "Баллы Ozon, ₽",
-                "partner_programs": "Программы партнёров, ₽",
-                "sale_commission": "Вознаграждение Ozon, ₽",
-                "delivery_fees": "Доставка и логистика, ₽",
-                "item_fees": "Дополнительные услуги и штрафы, ₽",
-                "delivered_units": "Доставлено, шт.",
-                "returned_units": "Возвращено, шт.",
-                "net_units": "Продано за вычетом возвратов, шт.",
-                "cost_price": "Историческая средняя себестоимость, ₽",
-                "cost_total": "Себестоимость заказанного количества, ₽",
-                "margin_pct": "Доля от продаж, %",
-                "profit_per_unit": "Прибыль за единицу, ₽",
-                "profit_period": "Прибыль за период, ₽",
-                "ordered_revenue": "Заказано на сумму, ₽",
-                "ordered_units": "Заказано, шт.",
-                "ms_name": "Название в МойСклад",
-                "ms_code": "Код в МойСклад",
+                "sku": "SKU Ozon", "offer_id": "Артикул", "name": "Название товара",
+                "scheme": "Схема работы", "ozon_cost_price": "Себестоимость из выгрузки, ₽",
+                "cost_price": "Историческая себестоимость МоегоСклада, ₽",
+                "cost_total": "Себестоимость доставленных товаров за вычетом возвратов, ₽",
+                "net_units": "Доставлено минус возвращено, шт.",
+                "price": "Текущая цена, ₽", "sent_to_delivery": "Передано в доставку, шт.",
+                "delivered_units": "Доставлено, шт.", "returned_units": "Возвращено, шт.",
+                "revenue": "Выручка, ₽", "discount_points": "Баллы за скидки, ₽",
+                "partner_programs": "Программы партнёров, ₽", "ozon_margin_pct": "Доля от продаж Ozon, %",
+                "ozon_profit_per_unit": "Прибыль за штуку из выгрузки, ₽",
+                "ozon_profit_period": "Прибыль за период из выгрузки, ₽",
+                "profit_before_cost": "Прибыль до себестоимости, ₽",
+                "profit_per_unit": "Прибыль после себестоимости за единицу, ₽",
+                "profit_period": "Прибыль после себестоимости за период, ₽",
+                "margin_pct": "Маржинальность после себестоимости, %",
+                "ms_name": "Название в МойСклад", "ms_code": "Код в МойСклад",
                 "cost_missing": "Себестоимость не найдена",
-                "has_finance": "Начисления найдены",
-                "revenue_total": "Продажи с баллами и программами, ₽",
-                "ozon_fees": "Расходы Ozon, ₽",
-                "seller_price_fallback": "Цена продавца из начислений, ₽",
-                "date": "Дата",
-                "accrued_category": "Категория начисления",
-                "type_id": "Код типа операции",
-                "unit_number": "Номер отправления или операции",
-                "amount": "Сумма, ₽",
-                "currency": "Валюта",
             }
             tab_report, tab_price = st.tabs(["Юнит-экономика", "Целевая маржинальность"])
             with tab_report:
-                st.subheader("Юнит-экономика по товарам")
-                display_columns = [
-                    "offer_id", "name", "sku", "price", "sales_revenue", "bonus_amount", "partner_programs",
-                    "sale_commission", "delivery_fees", "item_fees", "delivered_units", "returned_units",
-                    "ordered_units", "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
-                    "ordered_revenue", "ms_name", "cost_missing", "has_finance",
-                ]
-                table = report[[col for col in display_columns if col in report]].sort_values("sales_revenue", ascending=False)
-                st.dataframe(table.rename(columns=column_names_ru), use_container_width=True, height=500)
-                if not accruals.empty:
-                    with st.expander("Финансовые операции Ozon"):
-                        st.dataframe(accruals.rename(columns=column_names_ru), use_container_width=True)
-                if not unallocated_fees.empty:
-                    with st.expander("Начисления без привязки к товару"):
-                        st.dataframe(unallocated_fees.rename(columns=column_names_ru), use_container_width=True)
-                csv_report = report.drop(columns=["_merge"], errors="ignore").rename(columns=column_names_ru)
-                st.download_button("Скачать CSV", csv_report.to_csv(index=False).encode("utf-8-sig"), "ozon_moysklad_analytics.csv", "text/csv")
-
+                st.subheader("Юнит-экономика по товарам из выгрузки")
+                display_report = report.sort_values("profit_period", ascending=False, na_position="last").rename(columns=column_names_ru)
+                st.dataframe(display_report, use_container_width=True, height=520)
+                st.download_button(
+                    "Скачать расчёт CSV",
+                    display_report.to_csv(index=False).encode("utf-8-sig"),
+                    "ozon_moysklad_unit_economics.csv",
+                    "text/csv",
+                )
             with tab_price:
                 st.subheader("Расчёт цены для целевой маржинальности")
-                st.caption("Расчёт использует текущую цену из карточки Ozon и показатель «Прибыль за единицу» из таблицы юнит-экономики. Предполагается, что надбавка к цене увеличивает и прибыль на ту же сумму: целевая маржинальность = (прибыль за единицу + надбавка) / (цена Ozon + надбавка). Если текущая маржинальность уже достигнута, надбавка будет нулевой.")
+                st.caption("Используются текущая цена из выгрузки Ozon и прибыль после себестоимости за единицу. Надбавка рассчитывается по формуле: (целевая маржа × цена − прибыль за единицу) / (1 − целевая маржа).")
                 with st.form("target_margin_form"):
                     target_margin_pct = st.number_input(
-                        "Целевая маржинальность, %",
-                        min_value=0.0,
-                        max_value=95.0,
-                        value=30.0,
-                        step=1.0,
-                        key="target_margin_pct",
+                        "Целевая маржинальность, %", min_value=0.0, max_value=95.0,
+                        value=30.0, step=1.0, key="target_margin_pct",
                     )
                     st.form_submit_button("Пересчитать цены")
-                scenario_mask = (
-                    report["has_finance"]
-                    & ~report["cost_missing"]
-                    & (report["ordered_units"] > 0)
-                    & (report["price"] > 0)
-                    & report["profit_period"].notna()
-                )
-                scenario = report.loc[scenario_mask].copy()
+                scenario = report.loc[
+                    (~report["cost_missing"]) & report["profit_per_unit"].notna() & (report["price"] > 0)
+                ].copy()
                 if scenario.empty:
-                    st.info("Для расчёта нужны товары с начислениями, найденной себестоимостью, положительным количеством заказов и ценой из Ozon.")
+                    st.info("Для расчёта нужны товары с ценой, себестоимостью и положительным количеством доставленных товаров за вычетом возвратов.")
                 else:
-                    scenario["current_unit_price"] = scenario["price"]
-                    scenario["current_unit_profit"] = scenario["profit_per_unit"]
                     target_rate = target_margin_pct / 100
                     scenario["price_increase"] = (
-                        (target_rate * scenario["current_unit_price"] - scenario["current_unit_profit"])
+                        (target_rate * scenario["price"] - scenario["profit_per_unit"])
                         / (1 - target_rate)
                     ).clip(lower=0)
-                    scenario["recommended_unit_price"] = scenario["current_unit_price"] + scenario["price_increase"]
-                    scenario["projected_margin_pct"] = (
-                        (scenario["current_unit_profit"] + scenario["price_increase"])
-                        / scenario["recommended_unit_price"] * 100
+                    scenario["recommended_price"] = scenario["price"] + scenario["price_increase"]
+                    scenario["projected_margin"] = (
+                        (scenario["profit_per_unit"] + scenario["price_increase"])
+                        / scenario["recommended_price"] * 100
                     )
-
-                    scenario_columns_ru = {
-                        "offer_id": "Артикул",
-                        "name": "Название товара",
-                        "sku": "SKU Ozon",
-                        "current_unit_price": "Текущая цена из Ozon, ₽",
-                        "current_unit_profit": "Прибыль за единицу, ₽",
-                        "price_increase": "Добавить к цене, ₽",
-                        "recommended_unit_price": "Рекомендуемая цена, ₽",
-                        "projected_margin_pct": "Маржинальность после изменения, %",
-                    }
-                    scenario_view = scenario[[*scenario_columns_ru]].rename(columns=scenario_columns_ru)
-                    scenario_view = scenario_view.sort_values("Добавить к цене, ₽", ascending=False, na_position="last")
+                    scenario_view = scenario[["offer_id", "name", "sku", "price", "profit_per_unit", "price_increase", "recommended_price", "projected_margin"]].rename(columns={
+                        "offer_id": "Артикул", "name": "Название товара", "sku": "SKU Ozon",
+                        "price": "Текущая цена, ₽", "profit_per_unit": "Прибыль за единицу, ₽",
+                        "price_increase": "Добавить к цене, ₽", "recommended_price": "Рекомендуемая цена, ₽",
+                        "projected_margin": "Маржинальность после изменения, %",
+                    }).sort_values("Добавить к цене, ₽", ascending=False)
                     st.dataframe(scenario_view, use_container_width=True, height=500)
                     st.download_button(
-                        "Скачать расчёт цен CSV",
-                        scenario_view.to_csv(index=False).encode("utf-8-sig"),
-                        "ozon_target_margin_prices.csv",
-                        "text/csv",
+                        "Скачать расчёт цен CSV", scenario_view.to_csv(index=False).encode("utf-8-sig"),
+                        "ozon_target_margin_prices.csv", "text/csv",
                     )
-        except (RuntimeError, ValueError, requests.RequestException) as exc:
-            st.error(f"Не удалось собрать отчёт: {exc}")
+        except (RuntimeError, ValueError, requests.RequestException, ImportError) as exc:
+            st.error(f"Не удалось обработать файл или загрузить себестоимость: {exc}")
         except Exception as exc:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
+else:
+    st.info("Файл загружен. Нажмите «Рассчитать по таблице».")
 
 st.markdown("---")
-st.caption("Юнит-экономика по каждому SKU: себестоимость за период = историческая средняя себестоимость за единицу × заказанное количество. Прибыль за период = продажи + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − себестоимость за период. Прибыль за единицу = прибыль за период / заказанное количество.")
+st.caption("Источник продаж, начислений Ozon, цены и показателей прибыли — загруженная XLSX-выгрузка юнит-экономики. Историческая средневзвешенная себестоимость загружается из проведённых документов «Приёмка» и «Оприходование» в МоемСкладе.")
