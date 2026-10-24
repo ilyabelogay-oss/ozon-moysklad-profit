@@ -47,6 +47,7 @@ def request_json(
         raise RuntimeError("API вернул ответ не в формате JSON.") from exc
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_ozon_sales(
     client_id: str, api_key: str, date_from: date, date_to: date
 ) -> tuple[pd.DataFrame, bool, bool]:
@@ -95,6 +96,7 @@ def fetch_ozon_sales(
     )
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_ozon_sku_to_offer(client_id: str, api_key: str, skus: list[str]) -> pd.DataFrame:
     headers = ozon_headers(client_id, api_key)
     mapping = {}
@@ -238,6 +240,26 @@ def fetch_ozon_accruals(
     return accruals, sku_finance, unallocated
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_ozon_accruals_result(
+    client_id: str, api_key: str, date_from: date, date_to: date
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str | None]:
+    try:
+        accruals, sku_finance, unallocated = fetch_ozon_accruals(
+            client_id, api_key, date_from, date_to
+        )
+        return accruals, sku_finance, unallocated, None
+    except RuntimeError as exc:
+        # Cache short-lived API failures too, so UI-only reruns do not repeat
+        # a long failing request. Clicking the report button retries immediately.
+        return (
+            pd.DataFrame(columns=["date", "accrued_category", "type_id", "unit_number", "amount", "currency"]),
+            pd.DataFrame(columns=["sku", "sales_revenue", "bonus_amount", "partner_programs", "sale_commission", "delivery_fees", "item_fees", "has_finance"]),
+            pd.DataFrame(columns=["date", "type_id", "amount"]),
+            str(exc),
+        )
+
+
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def fetch_moysklad_costs(token: str) -> pd.DataFrame:
     headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
@@ -325,6 +347,12 @@ with st.sidebar:
         use_container_width=True,
         help="Заново загрузить историю приёмок и оприходований из МоегоСклада.",
     )
+    if run_report:
+        # An explicit report request refreshes Ozon data. Other Streamlit reruns,
+        # such as changing the target margin, reuse the recent API responses.
+        fetch_ozon_sales.clear()
+        fetch_ozon_sku_to_offer.clear()
+        fetch_ozon_accruals_result.clear()
     if refresh_costs:
         fetch_moysklad_costs.clear()
     if run_report or refresh_costs:
@@ -351,10 +379,10 @@ if run:
             sku_finance = pd.DataFrame(columns=finance_columns)
             unallocated_fees = pd.DataFrame(columns=["date", "type_id", "amount"])
             try:
-                accruals, sku_finance, unallocated_fees = fetch_ozon_accruals(
+                accruals, sku_finance, unallocated_fees, accrual_error = fetch_ozon_accruals_result(
                     client_id, api_key, date_from, date_to
                 )
-                accruals_loaded = True
+                accruals_loaded = accrual_error is None
             except RuntimeError as exc:
                 accruals = pd.DataFrame()
                 accrual_error = str(exc)
