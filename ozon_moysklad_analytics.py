@@ -18,6 +18,14 @@ def ozon_headers(client_id: str, api_key: str) -> dict:
     return {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
 
 
+def get_streamlit_secret(name: str) -> str:
+    try:
+        return str(st.secrets.get(name, "")).strip()
+    except (FileNotFoundError, KeyError):
+        # A local secrets.toml is optional; cloud secrets are configured in app settings.
+        return ""
+
+
 def request_json(method: str, url: str, *, headers: dict, payload: dict | None = None) -> dict:
     try:
         response = requests.request(method, url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
@@ -262,9 +270,14 @@ def validate_period(start: date, end: date) -> None:
 
 with st.sidebar:
     st.header("Подключение")
-    client_id = st.text_input("Ozon Client-Id", type="password")
-    api_key = st.text_input("Ozon Api-Key", type="password")
-    ms_token = st.text_input("Токен МоегоСклада", type="password")
+    secret_client_id = get_streamlit_secret("OZON_CLIENT_ID")
+    secret_api_key = get_streamlit_secret("OZON_API_KEY")
+    secret_ms_token = get_streamlit_secret("MOYSKLAD_TOKEN")
+    if any((secret_client_id, secret_api_key, secret_ms_token)):
+        st.caption("Секреты из настроек Streamlit используются автоматически.")
+    client_id = secret_client_id or st.text_input("Ozon Client-Id", type="password")
+    api_key = secret_api_key or st.text_input("Ozon Api-Key", type="password")
+    ms_token = secret_ms_token or st.text_input("Токен МоегоСклада", type="password")
     st.header("Период")
     default_end = date.today()
     default_start = default_end - timedelta(days=30)
