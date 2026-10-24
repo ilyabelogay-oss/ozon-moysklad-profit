@@ -228,7 +228,7 @@ elif run:
             report["net_units"] = report["delivered_units"] - report["returned_units"]
             report["cost_total"] = report["cost_price"] * report["net_units"]
             report["profit_per_unit"] = (
-                report["ozon_profit_per_unit"] - report["cost_price"]
+                report["ozon_profit_per_unit"] + report["ozon_cost_price"] - report["cost_price"]
             ).where(~report["cost_missing"]).round(4)
             report["profit_period"] = (
                 report["profit_per_unit"] * report["net_units"]
@@ -254,7 +254,7 @@ elif run:
             ).sum()
             margin_total = report.loc[valid_profit_rows, "profit_period"].sum() / margin_denominator * 100 if margin_denominator > 0 else 0
             c5.metric("Маржинальность от текущей цены", f"{margin_total:.2f}%")
-            st.info("Прибыль за единицу = «Прибыль за шт» из выгрузки Ozon − историческая себестоимость из МоегоСклада. Маржинальность = прибыль за единицу ÷ текущая цена × 100%. Прибыль за период = прибыль за единицу × (доставлено − возвращено).")
+            st.info("Прибыль за единицу пересчитывается заменой себестоимости: «Прибыль за шт» из Ozon + себестоимость Ozon из файла − историческая себестоимость из МоегоСклада. Маржинальность = прибыль за единицу ÷ текущая цена × 100%. Прибыль за период = прибыль за единицу × (доставлено − возвращено).")
 
             column_names_ru = {
                 "sku": "SKU Ozon", "offer_id": "Артикул", "name": "Название товара",
