@@ -281,7 +281,7 @@ elif run:
                 st.dataframe(display_report, use_container_width=True, height=520)
                 st.download_button(
                     "Скачать расчёт CSV",
-                    display_report.to_csv(index=False).encode("utf-8-sig"),
+                    display_report.to_csv(index=False, sep=";").encode("utf-8-sig"),
                     "ozon_moysklad_unit_economics.csv",
                     "text/csv",
                 )
@@ -323,7 +323,7 @@ elif run:
                     }).sort_values("Добавить к цене, ₽", ascending=False)
                     st.dataframe(scenario_view, use_container_width=True, height=500)
                     st.download_button(
-                        "Скачать расчёт цен CSV", scenario_view.to_csv(index=False).encode("utf-8-sig"),
+                        "Скачать расчёт цен CSV", scenario_view.to_csv(index=False, sep=";").encode("utf-8-sig"),
                         "ozon_target_margin_prices.csv", "text/csv",
                     )
         except (RuntimeError, ValueError, requests.RequestException, ImportError) as exc:
