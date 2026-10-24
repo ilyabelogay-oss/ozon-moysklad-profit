@@ -66,7 +66,6 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
     # Prices in MoySklad document positions are in kopecks, and quantity-weighting
     # avoids treating a one-unit purchase like a large replenishment.
     history_rows = []
-    source_names = {"supply": "supply", "enter": "enter"}
     for entity in ("supply", "enter"):
         offset = 0
         while True:
@@ -97,7 +96,6 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
                     history_rows.append({
                         "ms_code": str(code).strip(),
                         "ms_name": assortment.get("name", ""),
-                        "source": source_names[entity],
                         "receipt_value": float(price) * float(quantity) / 100,
                         "receipt_quantity": float(quantity),
                     })
@@ -107,34 +105,15 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
 
     history = pd.DataFrame(history_rows)
     if history.empty:
-        costs = pd.DataFrame(columns=[
-            "ms_code", "ms_name", "cost_price", "cost_supply", "quantity_supply",
-            "cost_enter", "quantity_enter",
-        ])
+        costs = pd.DataFrame(columns=["ms_code", "ms_name", "cost_price"])
     else:
-        by_source = history.groupby(["ms_code", "source"], as_index=False).agg(
+        costs = history.groupby("ms_code", as_index=False).agg(
             ms_name=("ms_name", "first"),
             receipt_value=("receipt_value", "sum"),
             receipt_quantity=("receipt_quantity", "sum"),
         )
-        by_source["source_cost"] = by_source["receipt_value"] / by_source["receipt_quantity"]
-        by_source["source_quantity"] = by_source["receipt_quantity"]
-        pivot = by_source.pivot(index="ms_code", columns="source", values=["source_cost", "source_quantity"])
-        pivot.columns = [f"{metric}_{source}" for metric, source in pivot.columns]
-        source_summary = pivot.reset_index()
-        totals = history.groupby("ms_code", as_index=False).agg(
-            ms_name=("ms_name", "first"),
-            receipt_value=("receipt_value", "sum"),
-            receipt_quantity=("receipt_quantity", "sum"),
-        )
-        totals["cost_price"] = totals["receipt_value"] / totals["receipt_quantity"]
-        costs = totals[["ms_code", "ms_name", "cost_price"]].merge(source_summary, on="ms_code", how="left")
-        costs = costs.rename(columns={
-            "source_cost_supply": "cost_supply",
-            "source_quantity_supply": "quantity_supply",
-            "source_cost_enter": "cost_enter",
-            "source_quantity_enter": "quantity_enter",
-        })
+        costs["cost_price"] = costs["receipt_value"] / costs["receipt_quantity"]
+        costs = costs.drop(columns=["receipt_value", "receipt_quantity"])
 
     return costs
 
@@ -248,20 +227,15 @@ elif run:
             report["cost_price"] = pd.to_numeric(report["cost_price"], errors="coerce")
             report["net_units"] = report["delivered_units"] - report["returned_units"]
             report["cost_total"] = report["cost_price"] * report["net_units"]
-            # Ozon's exported profit already includes its own cost column. Replace
-            # that cost with MoySklad's historical average using the export's
-            # delivered-minus-returned quantity basis.
-            report["profit_before_cost"] = report["ozon_profit_period"] + report["ozon_cost_price"] * report["net_units"]
+            report["profit_per_unit"] = (
+                report["ozon_profit_per_unit"] - report["cost_price"]
+            ).where(~report["cost_missing"]).round(4)
             report["profit_period"] = (
-                report["profit_before_cost"] - report["cost_total"]
-            ).where(~report["cost_missing"] & report["ozon_profit_period"].notna())
-            report["profit_per_unit"] = report["profit_period"].div(
-                report["net_units"].where(report["net_units"] > 0)
-            ).where(report["profit_period"].notna()).round(4)
-            revenue_base = report["revenue"] + report["discount_points"] + report["partner_programs"]
+                report["profit_per_unit"] * report["net_units"]
+            ).where(report["profit_per_unit"].notna() & (report["net_units"] > 0))
             report["margin_pct"] = (
-                report["profit_period"].div(revenue_base.where(revenue_base > 0)) * 100
-            ).where(report["profit_period"].notna()).round(2)
+                report["profit_per_unit"].div(report["price"].where(report["price"] > 0)) * 100
+            ).where(report["profit_per_unit"].notna()).round(2)
             progress.progress(100, text="Готово")
 
             missing_costs = int(report["cost_missing"].sum())
@@ -274,19 +248,18 @@ elif run:
             c3.metric("Себестоимость по МоемуСкладу", f"{report['cost_total'].sum(skipna=True):,.2f} ₽")
             c4.metric("Прибыль с найденной себестоимостью", f"{report['profit_period'].sum(skipna=True):,.2f} ₽")
             valid_profit_rows = report["profit_period"].notna()
-            margin_denominator = revenue_base.loc[valid_profit_rows].sum()
+            margin_denominator = (
+                report.loc[valid_profit_rows, "price"]
+                * report.loc[valid_profit_rows, "net_units"]
+            ).sum()
             margin_total = report.loc[valid_profit_rows, "profit_period"].sum() / margin_denominator * 100 if margin_denominator > 0 else 0
-            c5.metric("Маржинальность", f"{margin_total:.2f}%")
-            st.info("Все продажи, начисления Ozon, цены и показатели из выгрузки. Себестоимость из выгрузки заменяется исторической средневзвешенной себестоимостью из МоегоСклада. Прибыль пересчитывается как прибыль Ozon + себестоимость из файла × (доставлено − возвращено) − себестоимость МоегоСклада × (доставлено − возвращено).")
+            c5.metric("Маржинальность от текущей цены", f"{margin_total:.2f}%")
+            st.info("Прибыль за единицу = «Прибыль за шт» из выгрузки Ozon − историческая себестоимость из МоегоСклада. Маржинальность = прибыль за единицу ÷ текущая цена × 100%. Прибыль за период = прибыль за единицу × (доставлено − возвращено).")
 
             column_names_ru = {
                 "sku": "SKU Ozon", "offer_id": "Артикул", "name": "Название товара",
                 "scheme": "Схема работы", "ozon_cost_price": "Себестоимость из выгрузки, ₽",
                 "cost_price": "Историческая себестоимость МоегоСклада, ₽",
-                "cost_supply": "Средняя цена по приёмкам, ₽",
-                "quantity_supply": "Количество в приёмках, шт.",
-                "cost_enter": "Средняя цена по оприходованиям, ₽",
-                "quantity_enter": "Количество в оприходованиях, шт.",
                 "cost_total": "Себестоимость доставленных товаров за вычетом возвратов, ₽",
                 "net_units": "Доставлено минус возвращено, шт.",
                 "price": "Текущая цена, ₽", "sent_to_delivery": "Передано в доставку, шт.",
@@ -295,7 +268,6 @@ elif run:
                 "partner_programs": "Программы партнёров, ₽", "ozon_margin_pct": "Доля от продаж Ozon, %",
                 "ozon_profit_per_unit": "Прибыль за штуку из выгрузки, ₽",
                 "ozon_profit_period": "Прибыль за период из выгрузки, ₽",
-                "profit_before_cost": "Прибыль до себестоимости, ₽",
                 "profit_per_unit": "Прибыль после себестоимости за единицу, ₽",
                 "profit_period": "Прибыль после себестоимости за период, ₽",
                 "margin_pct": "Маржинальность после себестоимости, %",
@@ -315,7 +287,7 @@ elif run:
                 )
             with tab_price:
                 st.subheader("Расчёт цены для целевой маржинальности")
-                st.caption("Используются текущая цена из выгрузки Ozon и прибыль после себестоимости за единицу. Надбавка рассчитывается по формуле: (целевая маржа × цена − прибыль за единицу) / (1 − целевая маржа).")
+                st.caption("Используются текущая цена из выгрузки Ozon и прибыль после вычета себестоимости за единицу. Надбавка рассчитывается по формуле: (целевая маржа × цена − прибыль за единицу) / (1 − целевая маржа).")
                 with st.form("target_margin_form"):
                     target_margin_pct = st.number_input(
                         "Целевая маржинальность, %", min_value=0.0, max_value=95.0,
