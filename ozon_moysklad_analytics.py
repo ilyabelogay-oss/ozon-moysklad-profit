@@ -34,10 +34,27 @@ def request_json(
     payload: dict | None = None,
     params: dict | None = None,
 ) -> dict:
-    try:
-        response = requests.request(method, url, headers=headers, json=payload, params=params, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Не удалось подключиться к {url}: {exc}") from exc
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.request(
+                method, url, headers=headers, json=payload, params=params, timeout=REQUEST_TIMEOUT
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt == 2:
+                raise RuntimeError(f"Не удалось подключиться к {url} после 3 попыток: {exc}") from exc
+            time.sleep(1 + attempt * 2)
+            continue
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt < 2:
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    delay = max(1.0, min(float(retry_after), 15.0))
+                except (TypeError, ValueError):
+                    delay = 1 + attempt * 2
+                time.sleep(delay)
+                continue
+        break
     if not response.ok:
         detail = response.text[:500].strip()
         raise RuntimeError(f"API вернул {response.status_code}: {detail or response.reason}")
