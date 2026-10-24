@@ -138,19 +138,37 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
         code = item.get("code") or item.get("article") or item.get("productCode") or item.get("modificationCode")
         if not code:
             continue
+        stock = pd.to_numeric(item.get("stock"), errors="coerce")
+        total_cost = pd.to_numeric(item.get("sumTotal"), errors="coerce")
+        price = pd.to_numeric(item.get("price"), errors="coerce")
         rows.append({
             "ms_code": str(code).strip(),
             "ms_name": item.get("name", ""),
-            # In the stock report, price is the cost price and is returned in kopecks.
-            "cost_price": float(item.get("price") or 0) / 100,
-            "stock": item.get("stock", 0),
+            # sumTotal is the full cost of this row in kopecks. Keep the
+            # components so multiple stock rows can be combined by weighted cost.
+            "row_cost": float(total_cost) / 100 if pd.notna(total_cost) else None,
+            "row_stock": float(stock) if pd.notna(stock) else 0.0,
+            # price is a fallback unit cost, also in kopecks.
+            "row_price": float(price) / 100 if pd.notna(price) else None,
         })
     costs = pd.DataFrame(rows)
     if not costs.empty:
-        # A product may have rows for multiple warehouses; cost must not multiply.
+        # Combine warehouse/lot rows by total cost / total quantity. Selecting
+        # max(price) can materially overstate COGS when purchase costs differ.
         costs = costs.groupby("ms_code", as_index=False).agg(
-            ms_name=("ms_name", "first"), cost_price=("cost_price", "max"), stock=("stock", "sum")
+            ms_name=("ms_name", "first"),
+            total_cost=("row_cost", "sum"),
+            cost_rows=("row_cost", "count"),
+            row_count=("row_cost", "size"),
+            stock=("row_stock", "sum"),
+            fallback_price=("row_price", "mean"),
         )
+        all_costs_present = costs["cost_rows"] == costs["row_count"]
+        costs["cost_price"] = costs["total_cost"].div(
+            costs["stock"].where((costs["stock"] != 0) & all_costs_present)
+        )
+        costs["cost_price"] = costs["cost_price"].fillna(costs["fallback_price"])
+        costs = costs.drop(columns=["total_cost", "cost_rows", "row_count", "fallback_price"])
     return costs
 
 
@@ -231,15 +249,18 @@ if run:
             bonus_total = float(report["bonus_amount"].sum()) if not report.empty else 0.0
             units_total = float(report["ordered_units"].sum()) if not report.empty else 0.0
             cost_total = float(report["cost_total"].sum()) if not report.empty else 0.0
-            gross_total = revenue_total + bonus_total - cost_total
-            estimated_net = gross_total + expense_total
+            matched = report["cost_missing"] == False if not report.empty else pd.Series(dtype=bool)
+            matched_revenue = float(report.loc[matched, "revenue"].sum()) if not report.empty else 0.0
+            matched_bonus = float(report.loc[matched, "bonus_amount"].sum()) if not report.empty else 0.0
+            gross_total = matched_revenue + matched_bonus - cost_total
             unmatched = int(report["cost_missing"].sum()) if not report.empty else 0
             progress.progress(100, text="Готово")
 
             if more_sales:
                 st.warning("Ozon сообщает о дополнительных страницах аналитики. Для защиты от лимита API загружена только первая страница (до 1 000 строк); итог неполный.")
             if unmatched:
-                st.warning(f"Для {unmatched} из {len(report)} строк не найдена себестоимость. Такие строки исключены из расчёта себестоимости и прибыли.")
+                st.warning(f"Для {unmatched} из {len(report)} строк не найдена себестоимость. Прибыль показана только по товарам с найденной себестоимостью.")
+            st.warning("Это предварительная оценка: Ozon показывает заказанные единицы, а не подтверждённые выкупы; себестоимость взята из текущих остатков МоегоСклада, а не из партий на дату продажи. Возвраты и дата начисления баллов могут отличаться от даты заказа.")
             if not accruals_loaded:
                 message = "Финансовые операции не получены. Чистая прибыль не рассчитывается."
                 if accrual_error:
@@ -247,14 +268,12 @@ if run:
                 st.info(message)
 
             a, b, c, d, e, f = st.columns(6)
-            a.metric("Выручка Ozon", f"{revenue_total:,.2f} ₽")
+            a.metric("Выручка по заказам", f"{revenue_total:,.2f} ₽")
             b.metric("Баллы Ozon", f"{bonus_total:,.2f} ₽")
             c.metric("Заказано, шт.", f"{units_total:,.0f}")
             d.metric("Себестоимость", f"{report['cost_total'].fillna(0).sum():,.2f} ₽")
-            e.metric("Прибыль до расходов Ozon", f"{gross_total:,.2f} ₽")
-            f.metric("Расходы Ozon", f"{expense_total:,.2f} ₽" if accruals_loaded else "нет данных")
-            if accruals_loaded:
-                st.metric("Оценка после расходов Ozon", f"{estimated_net:,.2f} ₽", help="Выручка минус себестоимость найденных товаров плюс отрицательные суммы начислений. Это оценка: расходы не распределены по SKU.")
+            e.metric("Оценка прибыли по совпавшим товарам", f"{gross_total:,.2f} ₽")
+            f.metric("Отрицательные начисления", f"{expense_total:,.2f} ₽" if accruals_loaded else "нет данных", help="Сюда могут входить разные операции Ozon. Они показаны справочно и не вычитаются из прибыли, чтобы не смешивать расходы, возвраты и корректировки.")
 
             st.subheader("Продажи по товарам")
             display_columns = ["offer_id", "name", "sku", "revenue", "bonus_amount", "revenue_with_bonus", "ordered_units", "cost_price", "cost_total", "gross_profit", "margin_pct", "ms_name", "stock", "cost_missing"]
@@ -269,4 +288,4 @@ if run:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
 
 st.markdown("---")
-st.caption("Прибыль до расходов Ozon = выручка Ozon + баллы Ozon за скидки − себестоимость по заказанным единицам. Оценка после расходов также учитывает отрицательные суммы начислений, которые не распределяются по товарам. Сверяйте результаты с отчётами Ozon и МоегоСклада.")
+st.caption("Оценка прибыли = выручка по аналитике заказов + начисленные баллы Ozon − себестоимость × заказанные единицы (только товары с найденной себестоимостью). Это не чистая прибыль и не учёт по фактическим выкупам. Сверяйте результат с финансовым отчётом Ozon.")
