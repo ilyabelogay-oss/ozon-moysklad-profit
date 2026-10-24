@@ -295,10 +295,14 @@ elif run:
                     )
                     st.form_submit_button("Пересчитать цены")
                 scenario = report.loc[
-                    (~report["cost_missing"]) & report["profit_per_unit"].notna() & (report["price"] > 0)
+                    (~report["cost_missing"])
+                    & report["profit_per_unit"].notna()
+                    & report["margin_pct"].notna()
+                    & (report["price"] > 0)
+                    & (report["margin_pct"] < target_margin_pct)
                 ].copy()
                 if scenario.empty:
-                    st.info("Для расчёта нужны товары с ценой, себестоимостью и положительным количеством доставленных товаров за вычетом возвратов.")
+                    st.info("Нет товаров ниже заданной целевой маржинальности.")
                 else:
                     target_rate = target_margin_pct / 100
                     scenario["price_increase"] = (
