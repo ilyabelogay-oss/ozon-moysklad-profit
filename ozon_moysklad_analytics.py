@@ -155,9 +155,16 @@ def fetch_ozon_accruals(
                         "delivery_fees": 0.0, "item_fees": 0.0,
                         "seller_price_fallback": 0.0, "has_finance": True,
                     })
-                    row["sales_revenue"] += amount(commission.get("sale_amount"))
-                    row["bonus_amount"] += amount(commission.get("bonus"))
-                    row["partner_programs"] += amount(commission.get("coinvestment"))
+                    bonus = amount(commission.get("bonus"))
+                    partner_program = amount(commission.get("coinvestment"))
+                    # sale_amount includes the Ozon bonus and partner program
+                    # contributions in the daily finance response. Keep the
+                    # components separate so they are added only once below.
+                    row["sales_revenue"] += (
+                        amount(commission.get("sale_amount")) - bonus - partner_program
+                    )
+                    row["bonus_amount"] += bonus
+                    row["partner_programs"] += partner_program
                     # Store expenses as positive amounts. Ozon returns charges
                     # with a negative sign and refunds/adjustments with a positive one.
                     row["sale_commission"] -= amount(commission.get("sale_commission"))
@@ -416,13 +423,17 @@ if run:
             delivered_total = float(covered["delivered_units"].sum())
             returns_total = float(covered["returned_units"].sum())
             cost_total = float(report.loc[profit_rows, "cost_total"].sum()) if not report.empty else 0.0
-            profit_total = float(report.loc[profit_rows, "profit_period"].sum()) if not report.empty else 0.0
+            sku_profit_total = float(report.loc[profit_rows, "profit_period"].sum()) if not report.empty else 0.0
             matched_revenue_total = float(report.loc[profit_rows, "revenue_total"].sum()) if not report.empty else 0.0
-            margin_total = (profit_total / matched_revenue_total * 100
-                            if profit_total > 0 and matched_revenue_total > 0 else None)
             unmatched = int(report["cost_missing"].sum()) if not report.empty else 0
             finance_missing = int((~report["has_finance"]).sum()) if not report.empty else 0
             non_item_total = float(pd.to_numeric(unallocated_fees.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+            # Include unallocated Ozon accruals in the account-level KPI. They
+            # cannot be attributed to individual SKU rows, so leave row profit
+            # values unchanged and keep the amount visible in the caption.
+            profit_total = sku_profit_total + non_item_total
+            margin_total = (profit_total / matched_revenue_total * 100
+                            if profit_total > 0 and matched_revenue_total > 0 else None)
             progress.progress(100, text="Готово")
 
             if more_sales:
@@ -433,7 +444,7 @@ if run:
                 st.warning(f"По {finance_missing} товарам нет начислений Ozon за выбранный период; их прибыль не рассчитывается.")
             if not units_available:
                 st.warning("План Ozon API не вернул показатели доставленных и возвращённых товаров. Выручку по заказам можно посмотреть, но прибыль по формуле юнит-экономики не рассчитана.")
-            st.warning("Формула повторяет выгрузку юнит-экономики: выручка + баллы + программы партнёров + комиссии/услуги Ozon − себестоимость × (доставлено − возвращено). Себестоимость берётся из текущих остатков МоегоСклада, а не из исторических партий.")
+            st.info("Формула: выручка + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − историческая средняя себестоимость × (доставлено − возвращено). Баллы и программы партнёров не дублируются в выручке; нераспределённые начисления учитываются в общей прибыли, но не распределяются по товарам.")
             if not accruals_loaded:
                 message = "Финансовые операции не получены. Прибыль и маржинальность не рассчитываются."
                 if accrual_error:
@@ -447,7 +458,7 @@ if run:
             d.metric("Себестоимость", f"{cost_total:,.2f} ₽")
             e.metric("Прибыль за период", f"{profit_total:,.2f} ₽" if accruals_loaded else "нет данных")
             f.metric("Доля от продаж", f"{margin_total:.2f}%" if margin_total is not None else "—")
-            st.caption(f"Сводные суммы показаны только по SKU с начислениями и найденной себестоимостью ({int(profit_rows.sum())} из {len(report)} строк). Программы партнёров: {partner_total:,.2f} ₽ · Нераспределённые начисления без SKU: {non_item_total:,.2f} ₽; они не включены в прибыль по товарам.")
+            st.caption(f"Сводные суммы по товарам показаны только по SKU с начислениями и найденной себестоимостью ({int(profit_rows.sum())} из {len(report)} строк). Программы партнёров: {partner_total:,.2f} ₽ · Нераспределённые начисления без SKU: {non_item_total:,.2f} ₽; они включены в общую прибыль, но не распределены по товарам.")
 
             st.subheader("Юнит-экономика по товарам")
             display_columns = [
