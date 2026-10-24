@@ -314,9 +314,10 @@ elif run:
                         (scenario["profit_per_unit"] + scenario["price_increase"])
                         / scenario["recommended_price"] * 100
                     )
-                    scenario_view = scenario[["offer_id", "name", "sku", "price", "profit_per_unit", "price_increase", "recommended_price", "projected_margin"]].rename(columns={
+                    scenario_view = scenario[["offer_id", "name", "sku", "price", "margin_pct", "profit_per_unit", "price_increase", "recommended_price", "projected_margin"]].rename(columns={
                         "offer_id": "Артикул", "name": "Название товара", "sku": "SKU Ozon",
-                        "price": "Текущая цена, ₽", "profit_per_unit": "Прибыль за единицу, ₽",
+                        "price": "Текущая цена, ₽", "margin_pct": "Текущая маржинальность, %",
+                        "profit_per_unit": "Прибыль за единицу, ₽",
                         "price_increase": "Добавить к цене, ₽", "recommended_price": "Рекомендуемая цена, ₽",
                         "projected_margin": "Маржинальность после изменения, %",
                     }).sort_values("Добавить к цене, ₽", ascending=False)
