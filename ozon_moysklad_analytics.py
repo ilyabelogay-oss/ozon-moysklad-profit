@@ -11,7 +11,7 @@ REQUEST_TIMEOUT = 60
 
 st.set_page_config(page_title="Ozon + МойСклад — аналитика", layout="wide", page_icon="📊")
 st.title("Аналитика продаж Ozon и себестоимости МоегоСклада")
-st.caption("Сопоставление выполняется по offer_id Ozon и коду товара в МоемСкладе.")
+st.caption("Сопоставление выполняется по offer_id Ozon и коду товара в МоемСкладе. Себестоимость — средневзвешенная по проведённым документам «Приёмка» и «Оприходование» за всю доступную историю.")
 
 
 def ozon_headers(client_id: str, api_key: str) -> dict:
@@ -26,9 +26,16 @@ def get_streamlit_secret(name: str) -> str:
         return ""
 
 
-def request_json(method: str, url: str, *, headers: dict, payload: dict | None = None) -> dict:
+def request_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    payload: dict | None = None,
+    params: dict | None = None,
+) -> dict:
     try:
-        response = requests.request(method, url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+        response = requests.request(method, url, headers=headers, json=payload, params=params, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as exc:
         raise RuntimeError(f"Не удалось подключиться к {url}: {exc}") from exc
     if not response.ok:
@@ -221,43 +228,83 @@ def fetch_ozon_accruals(
 
 def fetch_moysklad_costs(token: str) -> pd.DataFrame:
     headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
-    response = request_json("GET", f"{MOYSKLAD_URL}/report/stock/all", headers=headers)
-    rows = []
-    for item in response.get("rows", []):
+    stock_response = request_json("GET", f"{MOYSKLAD_URL}/report/stock/all", headers=headers)
+    stock_rows = []
+    for item in stock_response.get("rows", []):
         code = item.get("code") or item.get("article") or item.get("productCode") or item.get("modificationCode")
         if not code:
             continue
         stock = pd.to_numeric(item.get("stock"), errors="coerce")
-        total_cost = pd.to_numeric(item.get("sumTotal"), errors="coerce")
-        price = pd.to_numeric(item.get("price"), errors="coerce")
-        rows.append({
+        stock_rows.append({
             "ms_code": str(code).strip(),
             "ms_name": item.get("name", ""),
-            # sumTotal is the full cost of this row in kopecks. Keep the
-            # components so multiple stock rows can be combined by weighted cost.
-            "row_cost": float(total_cost) / 100 if pd.notna(total_cost) else None,
             "row_stock": float(stock) if pd.notna(stock) else 0.0,
-            # price is a fallback unit cost, also in kopecks.
-            "row_price": float(price) / 100 if pd.notna(price) else None,
         })
-    costs = pd.DataFrame(rows)
-    if not costs.empty:
-        # Combine warehouse/lot rows by total cost / total quantity. Selecting
-        # max(price) can materially overstate COGS when purchase costs differ.
-        costs = costs.groupby("ms_code", as_index=False).agg(
+    stocks = pd.DataFrame(stock_rows, columns=["ms_code", "ms_name", "row_stock"])
+    if not stocks.empty:
+        stocks = stocks.groupby("ms_code", as_index=False).agg(
+            ms_name=("ms_name", "first"), stock=("row_stock", "sum")
+        )
+
+    # Average the unit prices from all posted receipts and inventory receipts.
+    # Prices in MoySklad document positions are in kopecks, and quantity-weighting
+    # avoids treating a one-unit purchase like a large replenishment.
+    history_rows = []
+    for entity in ("supply", "enter"):
+        offset = 0
+        while True:
+            response = request_json(
+                "GET",
+                f"{MOYSKLAD_URL}/entity/{entity}",
+                headers=headers,
+                params={
+                    "filter": "applicable=true",
+                    "limit": 100,
+                    "offset": offset,
+                    "expand": "positions.assortment",
+                },
+            )
+            documents = response.get("rows", [])
+            for document in documents:
+                if document.get("applicable") is not True:
+                    continue
+                position_collection = document.get("positions") or {}
+                positions = position_collection.get("rows", []) if isinstance(position_collection, dict) else position_collection
+                for position in positions:
+                    assortment = position.get("assortment") or {}
+                    code = assortment.get("code") or assortment.get("article")
+                    quantity = pd.to_numeric(position.get("quantity"), errors="coerce")
+                    price = pd.to_numeric(position.get("price"), errors="coerce")
+                    if not code or pd.isna(quantity) or quantity <= 0 or pd.isna(price) or price < 0:
+                        continue
+                    history_rows.append({
+                        "ms_code": str(code).strip(),
+                        "ms_name": assortment.get("name", ""),
+                        "receipt_value": float(price) * float(quantity) / 100,
+                        "receipt_quantity": float(quantity),
+                    })
+            if len(documents) < 100:
+                break
+            offset += len(documents)
+
+    history = pd.DataFrame(history_rows)
+    if history.empty:
+        costs = pd.DataFrame(columns=["ms_code", "ms_name", "cost_price"])
+    else:
+        costs = history.groupby("ms_code", as_index=False).agg(
             ms_name=("ms_name", "first"),
-            total_cost=("row_cost", "sum"),
-            cost_rows=("row_cost", "count"),
-            row_count=("row_cost", "size"),
-            stock=("row_stock", "sum"),
-            fallback_price=("row_price", "mean"),
+            receipt_value=("receipt_value", "sum"),
+            receipt_quantity=("receipt_quantity", "sum"),
         )
-        all_costs_present = costs["cost_rows"] == costs["row_count"]
-        costs["cost_price"] = costs["total_cost"].div(
-            costs["stock"].where((costs["stock"] != 0) & all_costs_present)
-        )
-        costs["cost_price"] = costs["cost_price"].fillna(costs["fallback_price"])
-        costs = costs.drop(columns=["total_cost", "cost_rows", "row_count", "fallback_price"])
+        costs["cost_price"] = costs["receipt_value"] / costs["receipt_quantity"]
+        costs = costs.drop(columns=["receipt_value", "receipt_quantity"])
+
+    if not stocks.empty:
+        costs = costs.merge(stocks, on="ms_code", how="outer", suffixes=("", "_stock"))
+        costs["ms_name"] = costs["ms_name"].fillna(costs.get("ms_name_stock"))
+        costs = costs.drop(columns=["ms_name_stock"], errors="ignore")
+    else:
+        costs["stock"] = 0.0
     return costs
 
 
@@ -420,7 +467,7 @@ if run:
                 "delivered_units": "Доставлено, шт.",
                 "returned_units": "Возвращено, шт.",
                 "net_units": "Продано за вычетом возвратов, шт.",
-                "cost_price": "Себестоимость за единицу, ₽",
+                "cost_price": "Историческая средняя себестоимость, ₽",
                 "cost_total": "Себестоимость за период, ₽",
                 "margin_pct": "Доля от продаж, %",
                 "profit_per_unit": "Прибыль за единицу, ₽",
