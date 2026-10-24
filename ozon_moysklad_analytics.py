@@ -32,16 +32,29 @@ def request_json(method: str, url: str, *, headers: dict, payload: dict | None =
         raise RuntimeError("API вернул ответ не в формате JSON.") from exc
 
 
-def fetch_ozon_sales(client_id: str, api_key: str, date_from: date, date_to: date) -> tuple[pd.DataFrame, bool]:
+def fetch_ozon_sales(
+    client_id: str, api_key: str, date_from: date, date_to: date
+) -> tuple[pd.DataFrame, bool, bool]:
     payload = {
         "date_from": date_from.isoformat(),
         "date_to": date_to.isoformat(),
-        "metrics": ["revenue", "ordered_units"],
+        "metrics": ["revenue", "ordered_units", "delivered_units", "returns"],
         "dimension": ["sku"],
         "limit": 1000,
         "offset": 0,
     }
-    response = request_json("POST", f"{OZON_URL}/v1/analytics/data", headers=ozon_headers(client_id, api_key), payload=payload)
+    units_available = True
+    try:
+        response = request_json("POST", f"{OZON_URL}/v1/analytics/data", headers=ozon_headers(client_id, api_key), payload=payload)
+    except RuntimeError as exc:
+        # Ozon restricts delivered/returned metrics for some account plans.
+        # Keep the order data, but never substitute orders for delivered units.
+        detail = str(exc).lower()
+        if not any(field in detail for field in ("delivered_units", "returns", "metric", "premium")):
+            raise
+        units_available = False
+        payload["metrics"] = ["revenue", "ordered_units"]
+        response = request_json("POST", f"{OZON_URL}/v1/analytics/data", headers=ozon_headers(client_id, api_key), payload=payload)
     result = response.get("result") or {}
     rows = []
     for item in result.get("data", []):
@@ -51,12 +64,20 @@ def fetch_ozon_sales(client_id: str, api_key: str, date_from: date, date_to: dat
             rows.append({
                 "sku": str(dimensions[0].get("id", "")),
                 "name": dimensions[0].get("name", ""),
-                "revenue": float(metrics[0]) if metrics else 0.0,
+                # Analytics revenue is an order metric. Keep it for comparison,
+                # but use finance accruals for the unit-economics calculation.
+                "ordered_revenue": float(metrics[0]) if metrics else 0.0,
                 "ordered_units": float(metrics[1]) if len(metrics) > 1 else 0.0,
+                "delivered_units": float(metrics[2]) if units_available and len(metrics) > 2 else None,
+                "returned_units": float(metrics[3]) if units_available and len(metrics) > 3 else None,
             })
     # Ozon currently applies a strict request limit to this endpoint. Do not silently
     # fetch a second page and risk turning a normal report into a rate-limit failure.
-    return pd.DataFrame(rows, columns=["sku", "name", "revenue", "ordered_units"]), bool(result.get("has_next", False))
+    return (
+        pd.DataFrame(rows, columns=["sku", "name", "ordered_revenue", "ordered_units", "delivered_units", "returned_units"]),
+        bool(result.get("has_next", False)),
+        units_available,
+    )
 
 
 def fetch_ozon_sku_to_offer(client_id: str, api_key: str, skus: list[str]) -> pd.DataFrame:
@@ -78,10 +99,20 @@ def fetch_ozon_sku_to_offer(client_id: str, api_key: str, skus: list[str]) -> pd
 
 def fetch_ozon_accruals(
     client_id: str, api_key: str, date_from: date, date_to: date
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     headers = ozon_headers(client_id, api_key)
     rows = []
-    bonus_rows = []
+    sku_rows = {}
+    unallocated_rows = []
+
+    def amount(value) -> float:
+        if isinstance(value, dict):
+            value = value.get("amount")
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     current_date = date_from
     while current_date <= date_to:
         last_id = ""
@@ -99,16 +130,59 @@ def fetch_ozon_accruals(
                 posting = item.get("posting") or {}
                 for product in posting.get("products") or []:
                     commission = product.get("commission") or {}
-                    bonus = commission.get("bonus") or {}
                     sku = product.get("sku")
-                    if sku is not None:
-                        bonus_rows.append({"sku": str(sku), "bonus_amount": float(bonus.get("amount") or 0)})
+                    if sku is None:
+                        continue
+                    sku = str(sku)
+                    row = sku_rows.setdefault(sku, {
+                        "sku": sku, "sales_revenue": 0.0, "bonus_amount": 0.0,
+                        "partner_programs": 0.0, "sale_commission": 0.0,
+                        "delivery_fees": 0.0, "item_fees": 0.0,
+                        "seller_price_fallback": 0.0, "has_finance": True,
+                    })
+                    row["sales_revenue"] += amount(commission.get("sale_amount"))
+                    row["bonus_amount"] += amount(commission.get("bonus"))
+                    row["partner_programs"] += amount(commission.get("coinvestment"))
+                    row["sale_commission"] += amount(commission.get("sale_commission"))
+                    row["seller_price_fallback"] += amount(commission.get("seller_price"))
+
+                    delivery = product.get("delivery") or {}
+                    delivery_total = delivery.get("total_accrued")
+                    if delivery_total is not None:
+                        row["delivery_fees"] += amount(delivery_total)
+                    else:
+                        for service in delivery.get("services") or []:
+                            row["delivery_fees"] += amount(service.get("accrued"))
+
+                # Item fees are already grouped by SKU by Ozon. Preserve the
+                # returned signs so charges reduce period profit.
+                for group in (item.get("item_fees") or {}).get("fees") or []:
+                    sku = group.get("sku")
+                    if sku is None:
+                        continue
+                    sku = str(sku)
+                    row = sku_rows.setdefault(sku, {
+                        "sku": sku, "sales_revenue": 0.0, "bonus_amount": 0.0,
+                        "partner_programs": 0.0, "sale_commission": 0.0,
+                        "delivery_fees": 0.0, "item_fees": 0.0,
+                        "seller_price_fallback": 0.0, "has_finance": True,
+                    })
+                    for fee in group.get("fees") or []:
+                        row["item_fees"] += amount(fee.get("accrued"))
+
+                non_item = item.get("non_item_fee") or {}
+                if non_item:
+                    unallocated_rows.append({
+                        "date": item.get("date") or current_date.isoformat(),
+                        "type_id": non_item.get("type_id", ""),
+                        "amount": amount(non_item.get("accrued")),
+                    })
                 rows.append({
                     "date": item.get("date") or current_date.isoformat(),
                     "accrued_category": item.get("accrued_category", ""),
                     "type_id": item.get("type_id", ""),
                     "unit_number": item.get("unit_number", ""),
-                    "amount": float(total.get("amount") or 0),
+                    "amount": amount(total),
                     "currency": total.get("currency", ""),
                 })
             next_id = response.get("last_id") or ""
@@ -124,10 +198,17 @@ def fetch_ozon_accruals(
         current_date += timedelta(days=1)
         time.sleep(0.25)
     accruals = pd.DataFrame(rows, columns=["date", "accrued_category", "type_id", "unit_number", "amount", "currency"])
-    bonuses = pd.DataFrame(bonus_rows, columns=["sku", "bonus_amount"])
-    if not bonuses.empty:
-        bonuses = bonuses.groupby("sku", as_index=False)["bonus_amount"].sum()
-    return accruals, bonuses
+    sku_finance = pd.DataFrame(sku_rows.values())
+    if not sku_finance.empty:
+        fallback = sku_finance["sales_revenue"].eq(0) & sku_finance["seller_price_fallback"].ne(0)
+        sku_finance.loc[fallback, "sales_revenue"] = (
+            sku_finance.loc[fallback, "seller_price_fallback"]
+            - sku_finance.loc[fallback, "bonus_amount"]
+            - sku_finance.loc[fallback, "partner_programs"]
+        )
+        sku_finance = sku_finance.drop(columns=["seller_price_fallback"])
+    unallocated = pd.DataFrame(unallocated_rows, columns=["date", "type_id", "amount"])
+    return accruals, sku_finance, unallocated
 
 
 def fetch_moysklad_costs(token: str) -> pd.DataFrame:
@@ -198,89 +279,128 @@ if run:
         try:
             validate_period(date_from, date_to)
             progress = st.progress(0, text="Загружаем продажи Ozon…")
-            sales, more_sales = fetch_ozon_sales(client_id, api_key, date_from, date_to)
-            progress.progress(25, text="Сопоставляем артикулы Ozon…")
-            if not sales.empty:
-                mapping = fetch_ozon_sku_to_offer(client_id, api_key, sales["sku"].dropna().unique().tolist())
-                sales = sales.merge(mapping, on="sku", how="left")
-            else:
-                sales["offer_id"] = pd.Series(dtype="object")
-            progress.progress(50, text="Загружаем себестоимость из МоегоСклада…")
+            sales, more_sales, units_available = fetch_ozon_sales(client_id, api_key, date_from, date_to)
+            progress.progress(20, text="Загружаем себестоимость из МоегоСклада…")
             costs = fetch_moysklad_costs(ms_token)
-            progress.progress(70, text="Загружаем финансовые операции Ozon…")
+            progress.progress(45, text="Загружаем финансовые операции Ozon…")
             accrual_error = None
             accruals_loaded = False
-            bonus_by_sku = pd.DataFrame(columns=["sku", "bonus_amount"])
+            finance_columns = [
+                "sku", "sales_revenue", "bonus_amount", "partner_programs",
+                "sale_commission", "delivery_fees", "item_fees", "has_finance",
+            ]
+            sku_finance = pd.DataFrame(columns=finance_columns)
+            unallocated_fees = pd.DataFrame(columns=["date", "type_id", "amount"])
             try:
-                accruals, bonus_by_sku = fetch_ozon_accruals(client_id, api_key, date_from, date_to)
+                accruals, sku_finance, unallocated_fees = fetch_ozon_accruals(
+                    client_id, api_key, date_from, date_to
+                )
                 accruals_loaded = True
             except RuntimeError as exc:
                 accruals = pd.DataFrame()
                 accrual_error = str(exc)
-            progress.progress(90, text="Считаем показатели…")
+            progress.progress(65, text="Сопоставляем товары и себестоимость…")
 
-            if not sales.empty and not costs.empty:
-                report = sales.merge(costs, left_on="offer_id", right_on="ms_code", how="left", indicator=True)
+            sales_columns = [
+                "sku", "name", "ordered_revenue", "ordered_units",
+                "delivered_units", "returned_units",
+            ]
+            if sales.empty:
+                sales = pd.DataFrame(columns=sales_columns)
+            report = sales.merge(sku_finance, on="sku", how="outer")
+            all_skus = report["sku"].dropna().astype(str).unique().tolist()
+            mapping = fetch_ozon_sku_to_offer(client_id, api_key, all_skus) if all_skus else pd.DataFrame(columns=["sku", "offer_id"])
+            report = report.merge(mapping, on="sku", how="left")
+            if not costs.empty:
+                report = report.merge(costs, left_on="offer_id", right_on="ms_code", how="left", indicator=True)
+                report["cost_missing"] = (report["_merge"] != "both") | (pd.to_numeric(report["cost_price"], errors="coerce") <= 0)
             else:
-                report = sales.copy()
                 for column in ("ms_code", "ms_name", "cost_price", "stock"):
                     report[column] = pd.NA
-                report["_merge"] = "left_only"
-            if not bonus_by_sku.empty:
-                report = report.merge(bonus_by_sku, on="sku", how="left")
-            else:
-                report["bonus_amount"] = 0.0
-            report["bonus_amount"] = pd.to_numeric(report["bonus_amount"], errors="coerce").fillna(0)
-            report["ordered_units"] = pd.to_numeric(report.get("ordered_units", 0), errors="coerce").fillna(0)
-            report["revenue"] = pd.to_numeric(report.get("revenue", 0), errors="coerce").fillna(0)
-            report["cost_price"] = pd.to_numeric(report["cost_price"], errors="coerce")
-            report["cost_total"] = report["cost_price"] * report["ordered_units"]
-            report["revenue_with_bonus"] = report["revenue"] + report["bonus_amount"]
-            report["gross_profit"] = report["revenue_with_bonus"] - report["cost_total"]
-            revenue_for_margin = report["revenue_with_bonus"].where(report["revenue_with_bonus"] != 0)
-            report["margin_pct"] = (report["gross_profit"] / revenue_for_margin * 100).round(1)
-            report["cost_missing"] = report["_merge"] != "both"
+                report["cost_missing"] = True
+            report["name"] = report["name"].fillna("")
+            report["has_finance"] = report["has_finance"].fillna(False).astype(bool)
+            if units_available:
+                report[["delivered_units", "returned_units"]] = report[["delivered_units", "returned_units"]].fillna(0)
+            numeric_columns = [
+                "ordered_revenue", "ordered_units", "delivered_units", "returned_units",
+                "sales_revenue", "bonus_amount", "partner_programs", "sale_commission",
+                "delivery_fees", "item_fees", "cost_price",
+            ]
+            for column in numeric_columns:
+                report[column] = pd.to_numeric(report.get(column), errors="coerce")
+                if column not in ("delivered_units", "returned_units"):
+                    report[column] = report[column].fillna(0)
 
-            expense_total = 0.0
-            if not accruals.empty and "amount" in accruals:
-                accruals["amount"] = pd.to_numeric(accruals["amount"], errors="coerce").fillna(0)
-                expense_total = float(accruals.loc[accruals["amount"] < 0, "amount"].sum())
-            revenue_total = float(report["revenue"].sum()) if not report.empty else 0.0
-            bonus_total = float(report["bonus_amount"].sum()) if not report.empty else 0.0
-            units_total = float(report["ordered_units"].sum()) if not report.empty else 0.0
-            cost_total = float(report["cost_total"].sum()) if not report.empty else 0.0
-            matched = report["cost_missing"] == False if not report.empty else pd.Series(dtype=bool)
-            matched_revenue = float(report.loc[matched, "revenue"].sum()) if not report.empty else 0.0
-            matched_bonus = float(report.loc[matched, "bonus_amount"].sum()) if not report.empty else 0.0
-            gross_total = matched_revenue + matched_bonus - cost_total
+            report["net_units"] = report["delivered_units"] - report["returned_units"]
+            report["revenue_total"] = report["sales_revenue"] + report["bonus_amount"] + report["partner_programs"]
+            report["ozon_fees"] = report["sale_commission"] + report["delivery_fees"] + report["item_fees"]
+            report["cost_total"] = report["cost_price"] * report["net_units"]
+            report["profit_period"] = (
+                report["revenue_total"] + report["ozon_fees"] - report["cost_total"]
+            ).where(report["has_finance"] & ~report["cost_missing"] & report["net_units"].notna())
+            report["profit_per_unit"] = report["profit_period"].div(
+                report["net_units"].where(report["net_units"] > 0)
+            ).where(report["profit_period"].notna()).fillna(0).round(4)
+            report["margin_pct"] = (
+                report["profit_period"].div(report["revenue_total"].where(report["revenue_total"] > 0)) * 100
+            ).where(report["profit_period"] > 0).round(2)
+
+            profit_rows = report["profit_period"].notna()
+            covered = report.loc[profit_rows]
+            sales_total = float(covered["sales_revenue"].sum())
+            bonus_total = float(covered["bonus_amount"].sum())
+            partner_total = float(covered["partner_programs"].sum())
+            delivered_total = float(covered["delivered_units"].sum())
+            returns_total = float(covered["returned_units"].sum())
+            cost_total = float(report.loc[profit_rows, "cost_total"].sum()) if not report.empty else 0.0
+            profit_total = float(report.loc[profit_rows, "profit_period"].sum()) if not report.empty else 0.0
+            matched_revenue_total = float(report.loc[profit_rows, "revenue_total"].sum()) if not report.empty else 0.0
+            margin_total = (profit_total / matched_revenue_total * 100
+                            if profit_total > 0 and matched_revenue_total > 0 else None)
             unmatched = int(report["cost_missing"].sum()) if not report.empty else 0
+            finance_missing = int((~report["has_finance"]).sum()) if not report.empty else 0
+            non_item_total = float(pd.to_numeric(unallocated_fees.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
             progress.progress(100, text="Готово")
 
             if more_sales:
                 st.warning("Ozon сообщает о дополнительных страницах аналитики. Для защиты от лимита API загружена только первая страница (до 1 000 строк); итог неполный.")
             if unmatched:
-                st.warning(f"Для {unmatched} из {len(report)} строк не найдена себестоимость. Прибыль показана только по товарам с найденной себестоимостью.")
-            st.warning("Это предварительная оценка: Ozon показывает заказанные единицы, а не подтверждённые выкупы; себестоимость взята из текущих остатков МоегоСклада, а не из партий на дату продажи. Возвраты и дата начисления баллов могут отличаться от даты заказа.")
+                st.warning(f"Для {unmatched} из {len(report)} строк себестоимость не найдена или равна нулю. Прибыль по ним не рассчитывается.")
+            if finance_missing:
+                st.warning(f"По {finance_missing} товарам нет начислений Ozon за выбранный период; их прибыль не рассчитывается.")
+            if not units_available:
+                st.warning("План Ozon API не вернул показатели доставленных и возвращённых товаров. Выручку по заказам можно посмотреть, но прибыль по формуле юнит-экономики не рассчитана.")
+            st.warning("Формула повторяет выгрузку юнит-экономики: выручка + баллы + программы партнёров + комиссии/услуги Ozon − себестоимость × (доставлено − возвращено). Себестоимость берётся из текущих остатков МоегоСклада, а не из исторических партий.")
             if not accruals_loaded:
-                message = "Финансовые операции не получены. Чистая прибыль не рассчитывается."
+                message = "Финансовые операции не получены. Прибыль и маржинальность не рассчитываются."
                 if accrual_error:
                     message += f" Причина: {accrual_error}"
                 st.info(message)
 
             a, b, c, d, e, f = st.columns(6)
-            a.metric("Выручка по заказам", f"{revenue_total:,.2f} ₽")
+            a.metric("Продажи по начислениям", f"{sales_total:,.2f} ₽")
             b.metric("Баллы Ozon", f"{bonus_total:,.2f} ₽")
-            c.metric("Заказано, шт.", f"{units_total:,.0f}")
-            d.metric("Себестоимость", f"{report['cost_total'].fillna(0).sum():,.2f} ₽")
-            e.metric("Оценка прибыли по совпавшим товарам", f"{gross_total:,.2f} ₽")
-            f.metric("Отрицательные начисления", f"{expense_total:,.2f} ₽" if accruals_loaded else "нет данных", help="Сюда могут входить разные операции Ozon. Они показаны справочно и не вычитаются из прибыли, чтобы не смешивать расходы, возвраты и корректировки.")
+            c.metric("Доставлено / возвраты", f"{delivered_total:,.0f} / {returns_total:,.0f} шт.")
+            d.metric("Себестоимость", f"{cost_total:,.2f} ₽")
+            e.metric("Прибыль за период", f"{profit_total:,.2f} ₽" if accruals_loaded else "нет данных")
+            f.metric("Доля от продаж", f"{margin_total:.2f}%" if margin_total is not None else "—")
+            st.caption(f"Сводные суммы показаны только по SKU с начислениями и найденной себестоимостью ({int(profit_rows.sum())} из {len(report)} строк). Программы партнёров: {partner_total:,.2f} ₽ · Нераспределённые начисления без SKU: {non_item_total:,.2f} ₽; они не включены в прибыль по товарам.")
 
-            st.subheader("Продажи по товарам")
-            display_columns = ["offer_id", "name", "sku", "revenue", "bonus_amount", "revenue_with_bonus", "ordered_units", "cost_price", "cost_total", "gross_profit", "margin_pct", "ms_name", "stock", "cost_missing"]
-            st.dataframe(report[[col for col in display_columns if col in report]].sort_values("revenue", ascending=False), use_container_width=True, height=500)
+            st.subheader("Юнит-экономика по товарам")
+            display_columns = [
+                "offer_id", "name", "sku", "sales_revenue", "bonus_amount", "partner_programs",
+                "sale_commission", "delivery_fees", "item_fees", "delivered_units", "returned_units",
+                "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
+                "ordered_revenue", "ms_name", "stock", "cost_missing", "has_finance",
+            ]
+            st.dataframe(report[[col for col in display_columns if col in report]].sort_values("sales_revenue", ascending=False), use_container_width=True, height=500)
             if not accruals.empty:
                 with st.expander("Финансовые операции Ozon"):
                     st.dataframe(accruals, use_container_width=True)
+            if not unallocated_fees.empty:
+                with st.expander("Начисления без привязки к товару"):
+                    st.dataframe(unallocated_fees, use_container_width=True)
             st.download_button("Скачать CSV", report.drop(columns=["_merge"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), "ozon_moysklad_analytics.csv", "text/csv")
         except (RuntimeError, ValueError, requests.RequestException) as exc:
             st.error(f"Не удалось собрать отчёт: {exc}")
@@ -288,4 +408,4 @@ if run:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
 
 st.markdown("---")
-st.caption("Оценка прибыли = выручка по аналитике заказов + начисленные баллы Ozon − себестоимость × заказанные единицы (только товары с найденной себестоимостью). Это не чистая прибыль и не учёт по фактическим выкупам. Сверяйте результат с финансовым отчётом Ozon.")
+st.caption("Юнит-экономика: прибыль за период = продажи + баллы + программы партнёров + комиссии и услуги Ozon − себестоимость × (доставлено − возвращено). Доля от продаж = прибыль за период / (продажи + баллы + программы партнёров). Для убыточных товаров доля не показывается, как в исходной выгрузке.")
