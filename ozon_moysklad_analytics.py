@@ -158,19 +158,21 @@ def fetch_ozon_accruals(
                     row["sales_revenue"] += amount(commission.get("sale_amount"))
                     row["bonus_amount"] += amount(commission.get("bonus"))
                     row["partner_programs"] += amount(commission.get("coinvestment"))
-                    row["sale_commission"] += amount(commission.get("sale_commission"))
+                    # Store expenses as positive amounts. Ozon returns charges
+                    # with a negative sign and refunds/adjustments with a positive one.
+                    row["sale_commission"] -= amount(commission.get("sale_commission"))
                     row["seller_price_fallback"] += amount(commission.get("seller_price"))
 
                     delivery = product.get("delivery") or {}
                     delivery_total = delivery.get("total_accrued")
                     if delivery_total is not None:
-                        row["delivery_fees"] += amount(delivery_total)
+                        row["delivery_fees"] -= amount(delivery_total)
                     else:
                         for service in delivery.get("services") or []:
-                            row["delivery_fees"] += amount(service.get("accrued"))
+                            row["delivery_fees"] -= amount(service.get("accrued"))
 
-                # Item fees are already grouped by SKU by Ozon. Preserve the
-                # returned signs so charges reduce period profit.
+                # Item fees are grouped by SKU. Convert the signed Ozon accrual
+                # to expenses, keeping refunds/adjustments as negative expenses.
                 for group in (item.get("item_fees") or {}).get("fees") or []:
                     sku = group.get("sku")
                     if sku is None:
@@ -183,7 +185,7 @@ def fetch_ozon_accruals(
                         "seller_price_fallback": 0.0, "has_finance": True,
                     })
                     for fee in group.get("fees") or []:
-                        row["item_fees"] += amount(fee.get("accrued"))
+                        row["item_fees"] -= amount(fee.get("accrued"))
 
                 non_item = item.get("non_item_fee") or {}
                 if non_item:
@@ -397,7 +399,7 @@ if run:
             report["ozon_fees"] = report["sale_commission"] + report["delivery_fees"] + report["item_fees"]
             report["cost_total"] = report["cost_price"] * report["net_units"]
             report["profit_period"] = (
-                report["revenue_total"] + report["ozon_fees"] - report["cost_total"]
+                report["revenue_total"] - report["ozon_fees"] - report["cost_total"]
             ).where(report["has_finance"] & ~report["cost_missing"] & report["net_units"].notna())
             report["profit_per_unit"] = report["profit_period"].div(
                 report["net_units"].where(report["net_units"] > 0)
@@ -505,4 +507,4 @@ if run:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
 
 st.markdown("---")
-st.caption("Юнит-экономика: прибыль за период = продажи + баллы + программы партнёров + комиссии и услуги Ozon − себестоимость × (доставлено − возвращено). Доля от продаж = прибыль за период / (продажи + баллы + программы партнёров). Для убыточных товаров доля не показывается, как в исходной выгрузке.")
+st.caption("Юнит-экономика: прибыль за период = продажи + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − себестоимость × (доставлено − возвращено). Расходы Ozon учитываются положительными суммами и вычитаются из выручки. Доля от продаж = прибыль за период / (продажи + баллы + программы партнёров). Для убыточных товаров доля не показывается, как в исходной выгрузке.")
