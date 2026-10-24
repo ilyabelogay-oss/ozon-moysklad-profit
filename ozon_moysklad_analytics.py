@@ -237,24 +237,6 @@ def fetch_ozon_accruals(
 
 def fetch_moysklad_costs(token: str) -> pd.DataFrame:
     headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
-    stock_response = request_json("GET", f"{MOYSKLAD_URL}/report/stock/all", headers=headers)
-    stock_rows = []
-    for item in stock_response.get("rows", []):
-        code = item.get("code") or item.get("article") or item.get("productCode") or item.get("modificationCode")
-        if not code:
-            continue
-        stock = pd.to_numeric(item.get("stock"), errors="coerce")
-        stock_rows.append({
-            "ms_code": str(code).strip(),
-            "ms_name": item.get("name", ""),
-            "row_stock": float(stock) if pd.notna(stock) else 0.0,
-        })
-    stocks = pd.DataFrame(stock_rows, columns=["ms_code", "ms_name", "row_stock"])
-    if not stocks.empty:
-        stocks = stocks.groupby("ms_code", as_index=False).agg(
-            ms_name=("ms_name", "first"), stock=("row_stock", "sum")
-        )
-
     # Average the unit prices from all posted receipts and inventory receipts.
     # Prices in MoySklad document positions are in kopecks, and quantity-weighting
     # avoids treating a one-unit purchase like a large replenishment.
@@ -308,12 +290,6 @@ def fetch_moysklad_costs(token: str) -> pd.DataFrame:
         costs["cost_price"] = costs["receipt_value"] / costs["receipt_quantity"]
         costs = costs.drop(columns=["receipt_value", "receipt_quantity"])
 
-    if not stocks.empty:
-        costs = costs.merge(stocks, on="ms_code", how="outer", suffixes=("", "_stock"))
-        costs["ms_name"] = costs["ms_name"].fillna(costs.get("ms_name_stock"))
-        costs = costs.drop(columns=["ms_name_stock"], errors="ignore")
-    else:
-        costs["stock"] = 0.0
     return costs
 
 
@@ -384,7 +360,7 @@ if run:
                 report = report.merge(costs, left_on="offer_id", right_on="ms_code", how="left", indicator=True)
                 report["cost_missing"] = (report["_merge"] != "both") | (pd.to_numeric(report["cost_price"], errors="coerce") <= 0)
             else:
-                for column in ("ms_code", "ms_name", "cost_price", "stock"):
+                for column in ("ms_code", "ms_name", "cost_price"):
                     report[column] = pd.NA
                 report["cost_missing"] = True
             report["name"] = report["name"].fillna("")
@@ -404,6 +380,7 @@ if run:
             report["net_units"] = report["delivered_units"] - report["returned_units"]
             report["revenue_total"] = report["sales_revenue"] + report["bonus_amount"] + report["partner_programs"]
             report["ozon_fees"] = report["sale_commission"] + report["delivery_fees"] + report["item_fees"]
+            # Historical unit cost times net delivered quantity, calculated per SKU.
             report["cost_total"] = report["cost_price"] * report["net_units"]
             report["profit_period"] = (
                 report["revenue_total"] - report["ozon_fees"] - report["cost_total"]
@@ -464,7 +441,7 @@ if run:
                 "offer_id", "name", "sku", "sales_revenue", "bonus_amount", "partner_programs",
                 "sale_commission", "delivery_fees", "item_fees", "delivered_units", "returned_units",
                 "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
-                "ordered_revenue", "ms_name", "stock", "cost_missing", "has_finance",
+                "ordered_revenue", "ms_name", "cost_missing", "has_finance",
             ]
             column_names_ru = {
                 "offer_id": "Артикул",
@@ -488,7 +465,6 @@ if run:
                 "ordered_units": "Заказано, шт.",
                 "ms_name": "Название в МойСклад",
                 "ms_code": "Код в МойСклад",
-                "stock": "Остаток, шт.",
                 "cost_missing": "Себестоимость не найдена",
                 "has_finance": "Начисления найдены",
                 "revenue_total": "Продажи с баллами и программами, ₽",
@@ -517,4 +493,4 @@ if run:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
 
 st.markdown("---")
-st.caption("Юнит-экономика: прибыль за период = продажи + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − себестоимость × (доставлено − возвращено). Расходы Ozon учитываются положительными суммами и вычитаются из выручки. Доля от продаж = прибыль за период / (продажи + баллы + программы партнёров). Для убыточных товаров доля не показывается, как в исходной выгрузке.")
+st.caption("Юнит-экономика по каждому SKU: прибыль за период = продажи + баллы + программы партнёров − вознаграждение Ozon − доставка и услуги Ozon − историческая себестоимость за единицу × (доставлено − возвращено). Доля от продаж = прибыль за период / (продажи + баллы + программы партнёров). Для убыточных товаров доля не показывается, как в исходной выгрузке.")
