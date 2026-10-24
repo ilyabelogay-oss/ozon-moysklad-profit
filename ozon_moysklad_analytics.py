@@ -185,7 +185,8 @@ if run:
             report["cost_price"] = pd.to_numeric(report["cost_price"], errors="coerce")
             report["cost_total"] = report["cost_price"] * report["ordered_units"]
             report["gross_profit"] = report["revenue"] - report["cost_total"]
-            report["margin_pct"] = (report["gross_profit"] / report["revenue"].replace(0, pd.NA) * 100).round(1)
+            revenue_for_margin = report["revenue"].where(report["revenue"] != 0)
+            report["margin_pct"] = (report["gross_profit"] / revenue_for_margin * 100).round(1)
             report["cost_missing"] = report["_merge"] != "both"
 
             expense_total = 0.0
