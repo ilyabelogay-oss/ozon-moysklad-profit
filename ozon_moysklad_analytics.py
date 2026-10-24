@@ -76,33 +76,44 @@ def fetch_ozon_sku_to_offer(client_id: str, api_key: str, skus: list[str]) -> pd
     return pd.DataFrame([{"sku": sku, "offer_id": offer} for sku, offer in mapping.items()])
 
 
-def fetch_ozon_transactions(client_id: str, api_key: str, date_from: date, date_to: date) -> tuple[pd.DataFrame, bool]:
+def fetch_ozon_accruals(client_id: str, api_key: str, date_from: date, date_to: date) -> pd.DataFrame:
     headers = ozon_headers(client_id, api_key)
-    operations = []
-    page = 1
-    while page <= 100:
-        payload = {
-            "filter": {
-                "date": {
-                    "from": f"{date_from.isoformat()}T00:00:00.000Z",
-                    "to": f"{date_to.isoformat()}T23:59:59.999Z",
-                },
-                "transaction_type": "all",
-            },
-            "page": page,
-            "page_size": 1000,
-        }
-        response = request_json("POST", f"{OZON_URL}/v3/finance/transaction/list", headers=headers, payload=payload)
-        result = response.get("result") or {}
-        batch = result.get("operations") or []
-        if not batch:
-            return pd.DataFrame(operations), False
-        operations.extend(batch)
-        if len(batch) < 1000:
-            return pd.DataFrame(operations), False
-        page += 1
+    rows = []
+    current_date = date_from
+    while current_date <= date_to:
+        last_id = ""
+        seen_cursors = set()
+        for _ in range(200):
+            response = request_json(
+                "POST",
+                f"{OZON_URL}/v1/finance/accrual/by-day",
+                headers=headers,
+                payload={"date": current_date.isoformat(), "last_id": last_id},
+            )
+            batch = response.get("accruals") or []
+            for item in batch:
+                total = item.get("total_amount") or {}
+                rows.append({
+                    "date": item.get("date") or current_date.isoformat(),
+                    "accrued_category": item.get("accrued_category", ""),
+                    "type_id": item.get("type_id", ""),
+                    "unit_number": item.get("unit_number", ""),
+                    "amount": float(total.get("amount") or 0),
+                    "currency": total.get("currency", ""),
+                })
+            next_id = response.get("last_id") or ""
+            if not batch or not next_id:
+                break
+            if next_id == last_id or next_id in seen_cursors:
+                raise RuntimeError(f"Ozon вернул повторяющийся курсор начислений за {current_date.isoformat()}.")
+            seen_cursors.add(next_id)
+            last_id = next_id
+            time.sleep(0.25)
+        else:
+            raise RuntimeError(f"Слишком много страниц начислений за {current_date.isoformat()}.")
+        current_date += timedelta(days=1)
         time.sleep(0.25)
-    return pd.DataFrame(operations), True
+    return pd.DataFrame(rows, columns=["date", "accrued_category", "type_id", "unit_number", "amount", "currency"])
 
 
 def fetch_moysklad_costs(token: str) -> pd.DataFrame:
@@ -165,12 +176,14 @@ if run:
             progress.progress(50, text="Загружаем себестоимость из МоегоСклада…")
             costs = fetch_moysklad_costs(ms_token)
             progress.progress(70, text="Загружаем финансовые операции Ozon…")
-            transaction_error = None
+            accrual_error = None
+            accruals_loaded = False
             try:
-                transactions, transactions_truncated = fetch_ozon_transactions(client_id, api_key, date_from, date_to)
+                accruals = fetch_ozon_accruals(client_id, api_key, date_from, date_to)
+                accruals_loaded = True
             except RuntimeError as exc:
-                transactions, transactions_truncated = pd.DataFrame(), False
-                transaction_error = str(exc)
+                accruals = pd.DataFrame()
+                accrual_error = str(exc)
             progress.progress(90, text="Считаем показатели…")
 
             if not sales.empty and not costs.empty:
@@ -190,9 +203,9 @@ if run:
             report["cost_missing"] = report["_merge"] != "both"
 
             expense_total = 0.0
-            if not transactions.empty and "amount" in transactions:
-                transactions["amount"] = pd.to_numeric(transactions["amount"], errors="coerce").fillna(0)
-                expense_total = float(transactions.loc[transactions["amount"] < 0, "amount"].sum())
+            if not accruals.empty and "amount" in accruals:
+                accruals["amount"] = pd.to_numeric(accruals["amount"], errors="coerce").fillna(0)
+                expense_total = float(accruals.loc[accruals["amount"] < 0, "amount"].sum())
             revenue_total = float(report["revenue"].sum()) if not report.empty else 0.0
             units_total = float(report["ordered_units"].sum()) if not report.empty else 0.0
             cost_total = float(report["cost_total"].sum()) if not report.empty else 0.0
@@ -203,14 +216,12 @@ if run:
 
             if more_sales:
                 st.warning("Ozon сообщает о дополнительных страницах аналитики. Для защиты от лимита API загружена только первая страница (до 1 000 строк); итог неполный.")
-            if transactions_truncated:
-                st.warning("Загрузка финансовых операций остановлена после 100 страниц. Итог расходов неполный.")
             if unmatched:
                 st.warning(f"Для {unmatched} из {len(report)} строк не найдена себестоимость. Такие строки исключены из расчёта себестоимости и прибыли.")
-            if transactions.empty:
+            if not accruals_loaded:
                 message = "Финансовые операции не получены. Чистая прибыль не рассчитывается."
-                if transaction_error:
-                    message += f" Причина: {transaction_error}"
+                if accrual_error:
+                    message += f" Причина: {accrual_error}"
                 st.info(message)
 
             a, b, c, d, e = st.columns(5)
@@ -218,16 +229,16 @@ if run:
             b.metric("Заказано, шт.", f"{units_total:,.0f}")
             c.metric("Себестоимость найденных товаров", f"{report['cost_total'].fillna(0).sum():,.2f} ₽")
             d.metric("Прибыль до расходов Ozon", f"{gross_total:,.2f} ₽")
-            e.metric("Расходы Ozon", f"{expense_total:,.2f} ₽" if not transactions.empty else "нет данных")
-            if not transactions.empty:
-                st.metric("Оценка после расходов Ozon", f"{estimated_net:,.2f} ₽", help="Выручка минус себестоимость найденных товаров плюс отрицательные суммы транзакций. Это оценка: транзакции не распределены по SKU.")
+            e.metric("Расходы Ozon", f"{expense_total:,.2f} ₽" if accruals_loaded else "нет данных")
+            if accruals_loaded:
+                st.metric("Оценка после расходов Ozon", f"{estimated_net:,.2f} ₽", help="Выручка минус себестоимость найденных товаров плюс отрицательные суммы начислений. Это оценка: расходы не распределены по SKU.")
 
             st.subheader("Продажи по товарам")
             display_columns = ["offer_id", "name", "sku", "revenue", "ordered_units", "cost_price", "cost_total", "gross_profit", "margin_pct", "ms_name", "stock", "cost_missing"]
             st.dataframe(report[[col for col in display_columns if col in report]].sort_values("revenue", ascending=False), use_container_width=True, height=500)
-            if not transactions.empty:
+            if not accruals.empty:
                 with st.expander("Финансовые операции Ozon"):
-                    st.dataframe(transactions, use_container_width=True)
+                    st.dataframe(accruals, use_container_width=True)
             st.download_button("Скачать CSV", report.drop(columns=["_merge"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), "ozon_moysklad_analytics.csv", "text/csv")
         except (RuntimeError, ValueError, requests.RequestException) as exc:
             st.error(f"Не удалось собрать отчёт: {exc}")
@@ -235,4 +246,4 @@ if run:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
 
 st.markdown("---")
-st.caption("Прибыль до расходов Ozon = выручка Ozon − себестоимость по заказанным единицам. Оценка после расходов вычитает отрицательные суммы финансовых операций, но не распределяет их по товарам. Сверяйте результаты с отчётами Ozon и МоегоСклада.")
+st.caption("Прибыль до расходов Ozon = выручка Ozon − себестоимость по заказанным единицам. Оценка после расходов учитывает отрицательные суммы начислений Ozon, но не распределяет расходы по товарам. Сверяйте результаты с отчётами Ozon и МоегоСклада.")
