@@ -106,10 +106,13 @@ def fetch_ozon_sku_to_offer(client_id: str, api_key: str, skus: list[str]) -> pd
             sku = str(item.get("sku", ""))
             offer_id = item.get("offer_id")
             if sku and offer_id:
-                mapping[sku] = str(offer_id).strip()
+                mapping[sku] = {
+                    "offer_id": str(offer_id).strip(),
+                    "price": item.get("price"),
+                }
         if start + 100 < len(numeric_skus):
             time.sleep(0.25)
-    return pd.DataFrame([{"sku": sku, "offer_id": offer} for sku, offer in mapping.items()])
+    return pd.DataFrame([{"sku": sku, **product} for sku, product in mapping.items()], columns=["sku", "offer_id", "price"])
 
 
 def fetch_ozon_accruals(
@@ -363,7 +366,7 @@ if run:
                 sales = pd.DataFrame(columns=sales_columns)
             report = sales.merge(sku_finance, on="sku", how="outer")
             all_skus = report["sku"].dropna().astype(str).unique().tolist()
-            mapping = fetch_ozon_sku_to_offer(client_id, api_key, all_skus) if all_skus else pd.DataFrame(columns=["sku", "offer_id"])
+            mapping = fetch_ozon_sku_to_offer(client_id, api_key, all_skus) if all_skus else pd.DataFrame(columns=["sku", "offer_id", "price"])
             report = report.merge(mapping, on="sku", how="left")
             if not costs.empty:
                 report = report.merge(costs, left_on="offer_id", right_on="ms_code", how="left", indicator=True)
@@ -379,7 +382,7 @@ if run:
             numeric_columns = [
                 "ordered_revenue", "ordered_units", "delivered_units", "returned_units",
                 "sales_revenue", "bonus_amount", "partner_programs", "sale_commission",
-                "delivery_fees", "item_fees", "cost_price",
+                "delivery_fees", "item_fees", "cost_price", "price",
             ]
             for column in numeric_columns:
                 report[column] = pd.to_numeric(report.get(column), errors="coerce")
@@ -447,6 +450,7 @@ if run:
 
             column_names_ru = {
                 "offer_id": "Артикул",
+                "price": "Цена Ozon, ₽",
                 "name": "Название товара",
                 "sku": "SKU Ozon",
                 "sales_revenue": "Продажи по начислениям, ₽",
@@ -483,7 +487,7 @@ if run:
             with tab_report:
                 st.subheader("Юнит-экономика по товарам")
                 display_columns = [
-                    "offer_id", "name", "sku", "sales_revenue", "bonus_amount", "partner_programs",
+                    "offer_id", "name", "sku", "price", "sales_revenue", "bonus_amount", "partner_programs",
                     "sale_commission", "delivery_fees", "item_fees", "delivered_units", "returned_units",
                     "ordered_units", "net_units", "cost_price", "cost_total", "margin_pct", "profit_per_unit", "profit_period",
                     "ordered_revenue", "ms_name", "cost_missing", "has_finance",
@@ -501,7 +505,7 @@ if run:
 
             with tab_price:
                 st.subheader("Расчёт цены для целевой маржинальности")
-                st.caption("Текущая цена оценивается по начислениям за выбранный период: (продажи + баллы + программы партнёров) / заказанное количество. При расчёте целевой цены комиссия Ozon считается пропорциональной цене, а логистика, услуги и себестоимость — фиксированными на единицу товара. Если текущая маржа уже не ниже цели, надбавка будет нулевой.")
+                st.caption("Расчёт использует текущую цену из карточки Ozon и показатель «Прибыль за единицу» из таблицы юнит-экономики. Предполагается, что надбавка к цене увеличивает и прибыль на ту же сумму: целевая маржинальность = (прибыль за единицу + надбавка) / (цена Ozon + надбавка). Если текущая маржинальность уже достигнута, надбавка будет нулевой.")
                 target_margin_pct = st.number_input(
                     "Целевая маржинальность, %",
                     min_value=0.0,
@@ -514,55 +518,36 @@ if run:
                     report["has_finance"]
                     & ~report["cost_missing"]
                     & (report["ordered_units"] > 0)
-                    & (report["revenue_total"] > 0)
+                    & (report["price"] > 0)
+                    & report["profit_period"].notna()
                 )
                 scenario = report.loc[scenario_mask].copy()
                 if scenario.empty:
-                    st.info("Для расчёта нужны товары с начислениями, найденной себестоимостью и положительным количеством заказов.")
+                    st.info("Для расчёта нужны товары с начислениями, найденной себестоимостью, положительным количеством заказов и ценой из Ozon.")
                 else:
-                    scenario["current_unit_price"] = scenario["revenue_total"] / scenario["ordered_units"]
-                    scenario["commission_rate"] = (
-                        scenario["sale_commission"] / scenario["revenue_total"]
-                    ).clip(lower=0, upper=0.95)
-                    scenario["other_fees_per_unit"] = (
-                        (scenario["delivery_fees"] + scenario["item_fees"])
-                        / scenario["ordered_units"]
-                    ).clip(lower=0)
+                    scenario["current_unit_price"] = scenario["price"]
+                    scenario["current_unit_profit"] = scenario["profit_per_unit"]
                     target_rate = target_margin_pct / 100
-                    denominator = 1 - scenario["commission_rate"] - target_rate
-                    feasible = denominator > 0
-                    scenario["target_unit_price"] = float("nan")
-                    scenario.loc[feasible, "target_unit_price"] = (
-                        scenario.loc[feasible, "cost_price"]
-                        + scenario.loc[feasible, "other_fees_per_unit"]
-                    ) / denominator.loc[feasible]
                     scenario["price_increase"] = (
-                        scenario["target_unit_price"] - scenario["current_unit_price"]
+                        (target_rate * scenario["current_unit_price"] - scenario["current_unit_profit"])
+                        / (1 - target_rate)
                     ).clip(lower=0)
                     scenario["recommended_unit_price"] = scenario["current_unit_price"] + scenario["price_increase"]
                     scenario["projected_margin_pct"] = (
-                        scenario["recommended_unit_price"] * (1 - scenario["commission_rate"])
-                        - scenario["other_fees_per_unit"] - scenario["cost_price"]
-                    ) / scenario["recommended_unit_price"] * 100
-                    scenario.loc[~feasible, "projected_margin_pct"] = pd.NA
-                    scenario["target_status"] = "Рассчитано"
-                    scenario.loc[~feasible, "target_status"] = "Цель недостижима при текущей комиссии"
+                        (scenario["current_unit_profit"] + scenario["price_increase"])
+                        / scenario["recommended_unit_price"] * 100
+                    )
 
                     scenario_columns_ru = {
                         "offer_id": "Артикул",
                         "name": "Название товара",
                         "sku": "SKU Ozon",
-                        "current_unit_price": "Текущая средняя цена, ₽",
-                        "cost_price": "Себестоимость за единицу, ₽",
-                        "commission_rate": "Комиссия Ozon, %",
-                        "other_fees_per_unit": "Логистика и услуги за единицу, ₽",
-                        "target_unit_price": "Цена для целевой маржи, ₽",
+                        "current_unit_price": "Текущая цена из Ozon, ₽",
+                        "current_unit_profit": "Прибыль за единицу, ₽",
                         "price_increase": "Добавить к цене, ₽",
-                        "recommended_unit_price": "Расчётная цена, ₽",
+                        "recommended_unit_price": "Рекомендуемая цена, ₽",
                         "projected_margin_pct": "Маржинальность после изменения, %",
-                        "target_status": "Результат",
                     }
-                    scenario["commission_rate"] *= 100
                     scenario_view = scenario[[*scenario_columns_ru]].rename(columns=scenario_columns_ru)
                     scenario_view = scenario_view.sort_values("Добавить к цене, ₽", ascending=False, na_position="last")
                     st.dataframe(scenario_view, use_container_width=True, height=500)
