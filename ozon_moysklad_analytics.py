@@ -7,6 +7,14 @@ import streamlit as st
 
 MOYSKLAD_URL = "https://api.moysklad.ru/api/remap/1.2"
 REQUEST_TIMEOUT = 60
+OZON_VARIABLE_EXPENSE_COLUMNS = ["Вознаграждение Ozon", "Эквайринг"]
+OZON_FIXED_EXPENSE_COLUMNS = [
+    "Обработка отправления", "Логистика", "Доставка до места выдачи",
+    "Стоимость размещения", "Обработка возврата", "Обратная логистика",
+    "Утилизация", "Дополнительная обработка ОВХ", "Операционные ошибки",
+    "Оплата за клик", "Оплата за заказ", "Звёздные товары", "Платный бренд", "Отзывы",
+]
+OZON_EXPENSE_COLUMNS = OZON_VARIABLE_EXPENSE_COLUMNS + OZON_FIXED_EXPENSE_COLUMNS
 
 st.set_page_config(page_title="Юнит-экономика Ozon + МойСклад", layout="wide", page_icon="📊")
 st.markdown(
@@ -286,6 +294,8 @@ elif run:
                 "Прибыль за период": "ozon_profit_period",
             }
             report = report.rename(columns=rename_columns)
+            if "scheme" not in report.columns:
+                report["scheme"] = "Не указана"
             for column in (
                 "ozon_profit_per_unit", "ozon_margin_pct",
             ):
@@ -297,7 +307,7 @@ elif run:
                 "ozon_cost_price", "price", "sent_to_delivery", "delivered_units",
                 "returned_units", "revenue", "discount_points", "partner_programs",
                 "ozon_profit_per_unit", "ozon_profit_period",
-            ]
+            ] + [column for column in OZON_EXPENSE_COLUMNS if column in report.columns]
             for column in numeric_columns:
                 if column in report:
                     report[column] = pd.to_numeric(report[column], errors="coerce")
@@ -358,7 +368,9 @@ elif run:
                 "ms_name": "Название в МойСклад", "ms_code": "Код в МойСклад",
                 "cost_missing": "Себестоимость не найдена",
             }
-            tab_report, tab_price = st.tabs(["Юнит-экономика", "Целевая маржинальность"])
+            tab_report, tab_price, tab_new_product = st.tabs([
+                "Юнит-экономика", "Целевая маржинальность", "Калькулятор нового товара",
+            ])
             with tab_report:
                 st.subheader("Юнит-экономика по товарам из выгрузки")
                 display_report = report.sort_values("profit_period", ascending=False, na_position="last").rename(columns=column_names_ru)
@@ -427,6 +439,95 @@ elif run:
                         "Скачать расчёт цен CSV", scenario_view.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
                         "ozon_target_margin_prices.csv", "text/csv",
                     )
+            with tab_new_product:
+                st.subheader("Цена для нового товара")
+                st.caption(
+                    "Калькулятор берёт средневзвешенную комиссию и эквайринг как долю от цены, "
+                    "а остальные расходы Ozon — как среднюю сумму на проданную единицу. "
+                    "Укажите себестоимость нового товара и желаемую маржинальность."
+                )
+                available_expense_columns = [
+                    column for column in OZON_EXPENSE_COLUMNS if column in report.columns
+                ]
+                if not available_expense_columns:
+                    st.warning("В загруженной таблице нет столбцов с расходами Ozon для расчёта средней доли.")
+                else:
+                    with st.form("new_product_price_form"):
+                        form_scheme, form_cost, form_margin = st.columns(3)
+                        available_schemes = sorted(
+                            report["scheme"].dropna().astype(str).str.strip().loc[lambda values: values != ""].unique().tolist()
+                        )
+                        scheme_options = ["Все схемы"] + available_schemes
+                        scheme_units = report.groupby("scheme")["net_units"].sum().sort_values(ascending=False)
+                        default_scheme = scheme_units.index[0] if not scheme_units.empty else "Все схемы"
+                        default_scheme_index = scheme_options.index(default_scheme) if default_scheme in scheme_options else 0
+                        with form_scheme:
+                            selected_scheme = st.selectbox("Схема продаж", scheme_options, index=default_scheme_index)
+                        with form_cost:
+                            new_product_cost = st.number_input(
+                                "Себестоимость товара, ₽", min_value=0.0, value=0.0,
+                                step=50.0, key="new_product_cost",
+                            )
+                        with form_margin:
+                            new_product_margin_pct = st.number_input(
+                                "Целевая маржинальность, %", min_value=0.0, max_value=95.0,
+                                value=30.0, step=1.0, key="new_product_margin_pct",
+                            )
+                        st.form_submit_button("Рассчитать цену")
+
+                    sales = report.copy()
+                    sales["scheme"] = sales["scheme"].fillna("").astype(str).str.strip()
+                    if selected_scheme != "Все схемы":
+                        sales = sales.loc[sales["scheme"] == selected_scheme]
+                    sales["sales_base"] = sales["price"] * sales["net_units"]
+                    eligible_sales = sales.loc[(sales["net_units"] > 0) & (sales["sales_base"] > 0)]
+                    weighted_price_base = eligible_sales["sales_base"].sum()
+                    available_variable_columns = [
+                        column for column in OZON_VARIABLE_EXPENSE_COLUMNS if column in eligible_sales.columns
+                    ]
+                    available_fixed_columns = [
+                        column for column in OZON_FIXED_EXPENSE_COLUMNS if column in eligible_sales.columns
+                    ]
+                    variable_expenses = -eligible_sales[available_variable_columns].sum().sum()
+                    expense_rate = variable_expenses / weighted_price_base if weighted_price_base > 0 else None
+                    sold_units = eligible_sales["net_units"].sum()
+                    fixed_expenses_per_unit = (
+                        -eligible_sales[available_fixed_columns].sum().sum() / sold_units
+                        if sold_units > 0 else None
+                    )
+                    if expense_rate is None:
+                        st.warning("Для выбранной схемы нет продаж с положительной ценой и количеством.")
+                    elif new_product_cost <= 0:
+                        st.info("Введите себестоимость нового товара, чтобы получить рекомендуемую цену.")
+                    else:
+                        st.caption(
+                            f"По схеме «{selected_scheme}»: комиссия и эквайринг в среднем составляют "
+                            f"{expense_rate * 100:.2f}% от текущей цены; прочие расходы — "
+                            f"{fixed_expenses_per_unit:,.2f} ₽ на проданную единицу."
+                        )
+                        margin_rate = new_product_margin_pct / 100
+                        denominator = 1 - expense_rate - margin_rate
+                        if denominator <= 0:
+                            st.error(
+                                "При такой доле расходов Ozon и целевой маржинальности "
+                                "расчётная цена не имеет конечного значения. Снизьте целевую маржинальность "
+                                "или выберите другую схему продаж."
+                            )
+                        else:
+                            recommended_new_price = (new_product_cost + fixed_expenses_per_unit) / denominator
+                            estimated_variable_expenses = recommended_new_price * expense_rate
+                            estimated_ozon_expenses = estimated_variable_expenses + fixed_expenses_per_unit
+                            estimated_profit = recommended_new_price - new_product_cost - estimated_ozon_expenses
+                            metric_price, metric_expenses, metric_profit, metric_margin = st.columns(4)
+                            metric_price.metric("Рекомендуемая цена", f"{recommended_new_price:,.2f} ₽")
+                            metric_expenses.metric("Расходы Ozon по оценке", f"{estimated_ozon_expenses:,.2f} ₽")
+                            metric_profit.metric("Прибыль после расходов и себестоимости", f"{estimated_profit:,.2f} ₽")
+                            metric_margin.metric("Маржинальность", f"{estimated_profit / recommended_new_price * 100:.2f}%")
+                            st.caption(
+                                "Формула: цена = (себестоимость + средние прочие расходы на единицу) / "
+                                "(1 − доля комиссии и эквайринга − целевая маржинальность). "
+                                "Это оценка по выбранной схеме и периоду выгрузки; тарифы, логистика и продвижение нового товара могут отличаться."
+                            )
         except (RuntimeError, ValueError, requests.RequestException, ImportError) as exc:
             st.error(f"Не удалось обработать файл или загрузить себестоимость: {exc}")
         except Exception as exc:
