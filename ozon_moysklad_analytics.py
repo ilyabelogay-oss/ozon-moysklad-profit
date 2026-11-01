@@ -1,4 +1,5 @@
 import io
+import math
 import time
 
 import pandas as pd
@@ -242,6 +243,270 @@ def normalize_code(value) -> str:
     return result
 
 
+def calculate_product_economics(settings: dict) -> dict:
+    """Calculate one-unit Ozon economics from editable seller assumptions."""
+    price = max(float(settings["price"]), 0.0)
+    buyout = min(max(float(settings["buyout"]), 0.01), 1.0)
+    non_buyout = 1.0 - buyout
+    volume = max(float(settings["volume"]), 0.0)
+    routes = settings["routes"]
+    route_share = sum(max(float(route["share"]), 0.0) for route in routes)
+    if route_share > 0:
+        forward_per_liter = sum(max(float(route["share"]), 0.0) * max(float(route["forward"]), 0.0) for route in routes) / route_share
+        return_per_liter = sum(max(float(route["share"]), 0.0) * max(float(route["reverse"]), 0.0) for route in routes) / route_share
+    else:
+        forward_per_liter = return_per_liter = 0.0
+
+    fbs = settings["scheme"] == "FBS"
+    price = float(settings["price"])
+    if settings["price_mode"] == "Цена покупателя":
+        price = price / max(1.0 - settings["coinvest_pct"], 0.01)
+    commission_rate = max(0.0, settings["commission_pct"] - settings["deferral_pp"])
+    if fbs and settings["fbs_new_rules"]:
+        dispatch_fee_pct = min(max(math.ceil(settings["fbs_dispatch_hours"] - 6.0), 0.0) * 0.0025, 0.03)
+        dispatch_fee = price * dispatch_fee_pct
+        late_penalty = min(price * settings["fbs_error_pct"], 2000.0) if not settings["fbs_on_time"] else 0.0
+        speed_adjustment = -(dispatch_fee + late_penalty) / buyout
+    else:
+        speed_adjustment = price * settings["speed_adjustment_pct"] if fbs else 0.0
+    commission = price * commission_rate - speed_adjustment
+    acquiring = price * settings["acquiring_pct"]
+
+    forward_logistics = forward_per_liter * volume / buyout
+    if fbs:
+        intake = settings["fbs_intake"] / buyout
+    else:
+        intake = 0.0 if settings["free_intake"] else min(5.0 + max(0, math.ceil(volume) - 1), 60.0)
+    delivery_pvz = min(price * settings["delivery_pvz_pct"], 25.0) / buyout
+    reverse_logistics = return_per_liter * volume * non_buyout / buyout
+    return_processing = 15.0 * non_buyout / buyout
+    repacking = settings["repack_tariff"] * settings["repack_share"] * non_buyout / buyout
+    total_logistics = forward_logistics + intake + delivery_pvz + reverse_logistics + return_processing + repacking
+    crossdock = 0.0 if fbs else settings["crossdock_per_liter"] * volume
+    advertising = price * settings["drr_pct"] / buyout
+    other_per_unit = settings["sku_monthly_expenses"] / max(settings["sales_month"], 1.0)
+    indirect_per_unit = settings["company_monthly_expenses"] * settings["sku_share"] / max(settings["sales_month"], 1.0)
+    stock_days = settings["stock_qty"] / max(settings["sales_month"], 1.0) * 30.0
+    insurance = max(price * settings["insurance_daily_pct"], 0.01) * stock_days if settings["insurance_on"] and not fbs and settings["sales_month"] > 0 else 0.0
+
+    coinvest_amount = price * settings["coinvest_pct"]
+    buyer_price = price - coinvest_amount
+    ozon_with_vat = commission + forward_logistics + advertising + crossdock + (0.0 if fbs else intake)
+    points_base = 0.99 * max(0.0, ozon_with_vat + reverse_logistics)
+    premium = max(0.0, coinvest_amount - points_base)
+    vat_rate = settings["vat_pct"]
+    output_vat = (buyer_price + premium) * vat_rate / (1.0 + vat_rate) if vat_rate else 0.0
+    vat_deductible = vat_rate not in (0.05, 0.07)
+    input_vat = 0.0
+    if vat_deductible:
+        input_vat += max(0.0, ozon_with_vat - min(coinvest_amount, points_base)) * settings["ozon_vat_rate"] / (1.0 + settings["ozon_vat_rate"])
+        input_vat += settings["cost"] * settings["supplier_vat_pct"] / (1.0 + settings["supplier_vat_pct"])
+        monthly_documented_unit = settings["monthly_documented_expenses"] * settings["sku_share"] / max(settings["sales_month"], 1.0)
+        input_vat += monthly_documented_unit * settings["monthly_expenses_vat_pct"] / (1.0 + settings["monthly_expenses_vat_pct"])
+    vat_payable = max(0.0, output_vat - input_vat)
+
+    deductible_expenses = settings["cost"] + total_logistics + commission + acquiring + advertising + crossdock + other_per_unit + indirect_per_unit + insurance
+    tax_base = max(0.0, deductible_expenses - settings["undocumented_expenses"])
+    fixed_contribution = settings["fixed_contribution_year"] / 12.0 / max(settings["sales_month"], 1.0) if settings["is_ip"] and settings["tax_system"] != "ОСНО" else 0.0
+    contribution_base = (buyer_price + premium - output_vat) if settings["tax_system"] in ("УСН Доходы", "УСН Доходы минус расходы") else max(0.0, price - tax_base - output_vat + input_vat)
+    variable_contribution = 0.01 * max(0.0, contribution_base) if settings["is_ip"] and settings["tax_system"] != "ОСНО" else 0.0
+    contributions = fixed_contribution + variable_contribution
+    tax_rate = settings["tax_rate"]
+    if settings["tax_system"] == "УСН Доходы":
+        income_tax = max(0.0, (buyer_price + premium - output_vat) * tax_rate - contributions)
+    elif settings["tax_system"] in ("УСН Доходы минус расходы", "УСН Доходы минус расходы (минимальный налог 1%)"):
+        income_tax = max((price - (tax_base + contributions) - output_vat + input_vat) * tax_rate, (buyer_price + premium) * 0.01)
+    elif settings["tax_system"] == "ОСНО":
+        income_tax = max(0.0, (price - output_vat) - (tax_base + contributions - input_vat)) * tax_rate
+    else:
+        income_tax = 0.0
+    tax = income_tax + vat_payable
+
+    expenses = commission + acquiring + total_logistics + advertising + settings["cost"] + crossdock + other_per_unit + indirect_per_unit + insurance + contributions
+    profit_before_tax = price - expenses
+    profit = profit_before_tax - tax
+    invested = settings["cost"] + crossdock
+    return {
+        "Цена продавца": price, "Цена покупателя": buyer_price, "Премия за баллы": premium,
+        "Комиссия Ozon": commission, "Эквайринг": acquiring,
+        "Прямая логистика": forward_logistics, "Приёмка": intake,
+        "Доставка до ПВЗ": delivery_pvz, "Обратная логистика": reverse_logistics,
+        "Обработка возврата": return_processing, "Доупаковка": repacking,
+        "Логистика всего": total_logistics, "Кросс-докинг": crossdock,
+        "Реклама": advertising, "Себестоимость": settings["cost"],
+        "Прочие расходы на товар": other_per_unit, "Доля общих расходов": indirect_per_unit,
+        "Страхование": insurance, "Страховые взносы": contributions,
+        "НДС к уплате": vat_payable, "Налог УСН / на прибыль": income_tax,
+        "Расходы до налога": expenses, "Прибыль до налога": profit_before_tax,
+        "Чистая прибыль": profit, "Маржинальность": profit / price * 100.0 if price > 0 else 0.0,
+        "ROI": profit / invested * 100.0 if invested > 0 else 0.0,
+        "Оборачиваемость, недель": settings["stock_qty"] / max(settings["sales_month"], 1.0) * 4.345,
+        "Денег в запасе": settings["stock_qty"] * settings["cost"],
+    }
+
+
+def render_full_product_calculator(report: pd.DataFrame) -> None:
+    st.subheader("Полная экономика нового товара")
+    st.caption("Введите тарифные допущения по вашему кабинету Ozon. Модель раскладывает расходы на одну выкупленную единицу, считает налоги и показывает P&L.")
+
+    eligible = report.loc[(report["net_units"] > 0) & (report["price"] > 0)].copy()
+    if not eligible.empty:
+        weighted_price = float((eligible["price"] * eligible["net_units"]).sum())
+        suggested_price = float(weighted_price / eligible["net_units"].sum())
+        suggested_cost = float(eligible["cost_price"].dropna().median()) if eligible["cost_price"].notna().any() else 0.0
+        def observed_rate(column: str) -> float:
+            if column not in eligible:
+                return 0.0
+            total = -float(pd.to_numeric(eligible[column], errors="coerce").fillna(0).sum())
+            return min(0.95, max(0.0, total / weighted_price))
+        suggested_commission = observed_rate("Вознаграждение Ozon")
+        suggested_acquiring = observed_rate("Эквайринг")
+        suggested_sales = float(eligible["net_units"].sum())
+    else:
+        suggested_price, suggested_cost, suggested_commission, suggested_acquiring, suggested_sales = 1000.0, 0.0, 0.0, 0.0, 0.0
+
+    with st.expander("Товар, цена и налоги", expanded=True):
+        a, b, c, d = st.columns(4)
+        with a:
+            scheme = st.selectbox("Схема", ["FBO", "FBS"], key="fullcalc_scheme")
+            price_mode = st.selectbox("Вводимая цена", ["Предельная цена продавца", "Цена покупателя"], key="fullcalc_price_mode")
+            sale_price = st.number_input("Цена, ₽", min_value=0.0, value=float(round(suggested_price, 2)), step=50.0, key="fullcalc_price")
+        with b:
+            cost = st.number_input("Себестоимость с упаковкой, ₽/шт.", min_value=0.0, value=float(round(suggested_cost, 2)), step=10.0, key="fullcalc_cost")
+            coinvest_pct = st.number_input("Баллы / соинвест, %", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="fullcalc_coinvest") / 100
+            volume = st.number_input("Объём товара, л", min_value=0.0, value=1.0, step=0.1, key="fullcalc_volume")
+        with c:
+            commission_pct = st.number_input("Комиссия Ozon, %", min_value=0.0, max_value=100.0, value=round(suggested_commission * 100, 2), step=0.5, key="fullcalc_commission") / 100
+            acquiring_pct = st.number_input("Эквайринг, %", min_value=0.0, max_value=100.0, value=round(suggested_acquiring * 100, 2), step=0.1, key="fullcalc_acquiring") / 100
+            deferral_pp = st.number_input("Снижение комиссии за отсрочку, п.п.", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="fullcalc_deferral") / 100
+        with d:
+            buyout_pct = st.number_input("Выкуп, %", min_value=1.0, max_value=100.0, value=90.0, step=1.0, key="fullcalc_buyout") / 100
+            speed_adjustment_pct = st.number_input("Скидка к комиссии / сбор FBS, %", min_value=-100.0, max_value=100.0, value=0.0, step=0.25, key="fullcalc_speed") / 100
+            drr_pct = st.number_input("Реклама, ДРР от заказа, %", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="fullcalc_drr") / 100
+
+    with st.expander("Логистика, возвраты и поставка", expanded=True):
+        st.caption("Укажите тариф ₽/л по направлениям и долю заказов. Сумма долей нормируется автоматически. Заполните тарифы по фактическим кластерам вашего товара.")
+        routes_default = pd.DataFrame([
+            {"Кластер назначения": "Свой кластер", "Доля заказов, %": 0.0, "Доставка, ₽/л": 0.0, "Обратная логистика, ₽/л": 0.0},
+            {"Кластер назначения": "Соседние кластеры", "Доля заказов, %": 0.0, "Доставка, ₽/л": 0.0, "Обратная логистика, ₽/л": 0.0},
+            {"Кластер назначения": "Другие кластеры", "Доля заказов, %": 100.0, "Доставка, ₽/л": 0.0, "Обратная логистика, ₽/л": 0.0},
+        ])
+        routes = st.data_editor(routes_default, num_rows="dynamic", use_container_width=True, hide_index=True, key="fullcalc_routes", column_config={
+            "Кластер назначения": st.column_config.TextColumn("Кластер назначения"),
+            "Доля заказов, %": st.column_config.NumberColumn(min_value=0.0, max_value=100.0, step=1.0),
+            "Доставка, ₽/л": st.column_config.NumberColumn(min_value=0.0, step=1.0),
+            "Обратная логистика, ₽/л": st.column_config.NumberColumn(min_value=0.0, step=1.0),
+        })
+        x, y, z, q = st.columns(4)
+        with x:
+            free_intake = st.checkbox("Бесплатная приёмка FBO", value=False, key="fullcalc_free_intake")
+            fbs_intake = st.number_input("Обработка отправления FBS, ₽", min_value=0.0, value=0.0, step=1.0, key="fullcalc_fbs_intake")
+            fbs_new_rules = st.checkbox("FBS: правила со сбором за время и индексом ошибок", value=False, key="fullcalc_fbs_new_rules")
+            fbs_dispatch_hours = st.number_input("Время до отгрузки, ч", min_value=0.0, max_value=24.0, value=6.0, step=0.5, key="fullcalc_fbs_hours")
+            fbs_error_pct = st.selectbox("Индекс ошибок FBS", [0.0, 0.01, 0.02, 0.04, 0.08], format_func=lambda value: f"{value * 100:.0f}%", key="fullcalc_fbs_error")
+            fbs_on_time = st.checkbox("Отгрузка без просрочки", value=True, key="fullcalc_fbs_on_time")
+        with y:
+            delivery_pvz_pct = st.number_input("Доставка до ПВЗ, %", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key="fullcalc_pvz") / 100
+            repack_tariff = st.number_input("Тариф доупаковки, ₽", min_value=0.0, value=15.0, step=1.0, key="fullcalc_repack")
+        with z:
+            repack_share = st.number_input("Доля невыкупов с доупаковкой, %", min_value=0.0, max_value=100.0, value=45.0, step=1.0, key="fullcalc_repack_share") / 100
+            crossdock_per_liter = st.number_input("Кросс-докинг, ₽/л", min_value=0.0, value=0.0, step=1.0, key="fullcalc_crossdock")
+        with q:
+            st.write("Приёмка FBO рассчитывается автоматически по объёму: до 1 л — 5 ₽, далее по 1 ₽/л, максимум 60 ₽.")
+        if not routes.empty:
+            shares_total = pd.to_numeric(routes["Доля заказов, %"], errors="coerce").fillna(0).sum()
+            if abs(float(shares_total) - 100.0) > 0.1:
+                st.warning(f"Сумма долей кластеров сейчас {shares_total:.1f}%. Для среднего тарифа доли будут нормированы.")
+
+    with st.expander("Налоги, запасы и расходы компании"):
+        l, r = st.columns(2)
+        with l:
+            tax_system = st.selectbox("Налоговый режим", ["Без налога", "УСН Доходы", "УСН Доходы минус расходы", "ОСНО"], key="fullcalc_tax_system")
+            tax_rate = st.number_input("Ставка налога, %", min_value=0.0, max_value=100.0, value=6.0, step=0.5, key="fullcalc_tax_rate") / 100
+            vat_pct = st.number_input("НДС в цене, %", min_value=0.0, max_value=100.0, value=0.0, step=1.0, key="fullcalc_vat") / 100
+            supplier_vat_pct = st.selectbox("НДС поставщика по себестоимости", [0.0, 0.05, 0.07, 0.10, 0.20, 0.22], format_func=lambda value: f"{value * 100:g}%", key="fullcalc_supplier_vat")
+            is_ip = st.checkbox("ИП (учитывать страховые взносы)", value=True, key="fullcalc_is_ip")
+        with r:
+            sales_month = st.number_input("Продаж в месяц, шт.", min_value=0.0, value=float(max(round(suggested_sales), 0)), step=10.0, key="fullcalc_sales_month")
+            stock_qty = st.number_input("Остаток на складах, шт.", min_value=0.0, value=0.0, step=10.0, key="fullcalc_stock")
+            sku_share = st.number_input("Доля товара в обороте компании, %", min_value=0.0, max_value=100.0, value=100.0, step=1.0, key="fullcalc_share") / 100
+            company_monthly_expenses = st.number_input("Общие расходы компании, ₽/мес.", min_value=0.0, value=0.0, step=1000.0, key="fullcalc_company_expenses")
+            sku_monthly_expenses = st.number_input("Расходы именно на этот товар, ₽/мес.", min_value=0.0, value=0.0, step=100.0, key="fullcalc_sku_expenses")
+        u, v, w = st.columns(3)
+        with u:
+            fixed_contribution_year = st.number_input("Фиксированные взносы ИП, ₽/год", min_value=0.0, value=57390.0 if is_ip and tax_system != "ОСНО" else 0.0, step=1000.0, key="fullcalc_fixed_contrib")
+        with v:
+            insurance_on = st.checkbox("Страхование товара Ozon включено (FBO)", value=False, key="fullcalc_insurance_on")
+            insurance_daily_pct = st.number_input("Тариф страхования от цены в день, %", min_value=0.0, value=0.0838, step=0.001, key="fullcalc_insurance_rate") / 100
+        with w:
+            undocumented_expenses = st.number_input("Из расходов выше: без документов, ₽/ед.", min_value=0.0, value=0.0, step=1.0, key="fullcalc_undoc")
+            monthly_documented_expenses = st.number_input("Из расходов выше: документированные, ₽/мес.", min_value=0.0, value=0.0, step=100.0, key="fullcalc_doc_expenses")
+            monthly_expenses_vat_pct = st.selectbox("Ставка НДС по этим расходам", [0.0, 0.05, 0.07, 0.10, 0.20, 0.22], format_func=lambda value: f"{value * 100:g}%", key="fullcalc_monthly_vat")
+
+    target_margin = st.number_input("Целевая маржинальность для расчёта цены, %", min_value=0.0, max_value=95.0, value=20.0, step=1.0, key="fullcalc_target_margin") / 100
+    routes_records = routes.to_dict("records") if not routes.empty else []
+    route_settings = [{
+        "share": float(pd.to_numeric(pd.Series([row.get("Доля заказов, %", 0)]), errors="coerce").fillna(0).iloc[0]),
+        "forward": float(pd.to_numeric(pd.Series([row.get("Доставка, ₽/л", 0)]), errors="coerce").fillna(0).iloc[0]),
+        "reverse": float(pd.to_numeric(pd.Series([row.get("Обратная логистика, ₽/л", 0)]), errors="coerce").fillna(0).iloc[0]),
+    } for row in routes_records]
+    settings = {
+        "scheme": scheme, "price_mode": "Цена покупателя" if price_mode == "Цена покупателя" else "Предельная цена продавца",
+        "price": sale_price, "cost": cost, "coinvest_pct": coinvest_pct, "volume": volume,
+        "commission_pct": commission_pct, "acquiring_pct": acquiring_pct, "deferral_pp": deferral_pp,
+        "buyout": buyout_pct, "speed_adjustment_pct": speed_adjustment_pct, "routes": route_settings,
+        "fbs_new_rules": fbs_new_rules, "fbs_dispatch_hours": fbs_dispatch_hours,
+        "fbs_error_pct": fbs_error_pct, "fbs_on_time": fbs_on_time,
+        "free_intake": free_intake, "fbs_intake": fbs_intake, "delivery_pvz_pct": delivery_pvz_pct,
+        "repack_tariff": repack_tariff, "repack_share": repack_share, "crossdock_per_liter": crossdock_per_liter,
+        "drr_pct": drr_pct, "sales_month": sales_month, "sku_monthly_expenses": sku_monthly_expenses,
+        "company_monthly_expenses": company_monthly_expenses, "sku_share": sku_share,
+        "stock_qty": stock_qty, "insurance_on": insurance_on, "insurance_daily_pct": insurance_daily_pct,
+        "vat_pct": vat_pct, "supplier_vat_pct": supplier_vat_pct,
+        "monthly_expenses_vat_pct": monthly_expenses_vat_pct, "ozon_vat_rate": 0.22,
+        "tax_system": tax_system, "tax_rate": tax_rate, "is_ip": is_ip,
+        "fixed_contribution_year": fixed_contribution_year, "undocumented_expenses": undocumented_expenses,
+        "monthly_documented_expenses": monthly_documented_expenses,
+    }
+    actual = calculate_product_economics(settings)
+    current_seller_price = actual["Цена продавца"]
+    if actual["Маржинальность"] >= target_margin * 100:
+        recommended = current_seller_price
+    else:
+        lower, upper = current_seller_price, max(current_seller_price * 10.0, cost * 20.0, 1000.0)
+        for _ in range(60):
+            mid = (lower + upper) / 2.0
+            probe = dict(settings, price=mid, price_mode="Предельная цена продавца")
+            if calculate_product_economics(probe)["Маржинальность"] >= target_margin * 100:
+                upper = mid
+            else:
+                lower = mid
+        recommended = upper
+    recommended_settings = dict(settings, price=recommended, price_mode="Предельная цена продавца")
+    forecast = calculate_product_economics(recommended_settings)
+    target_reachable = forecast["Маржинальность"] + 0.05 >= target_margin * 100
+
+    st.markdown("#### Результат")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Рекомендуемая предельная цена", f"{recommended:,.2f} ₽" if target_reachable else "не достигается")
+    m2.metric("Чистая прибыль при введённой цене", f"{actual['Чистая прибыль']:,.2f} ₽")
+    m3.metric("Маржинальность", f"{actual['Маржинальность']:.1f}%")
+    m4.metric("При целевой цене", f"{forecast['Чистая прибыль']:,.2f} ₽ · {forecast['Маржинальность']:.1f}%")
+    pnl = pd.DataFrame({
+        "Статья": list(actual.keys()),
+        "При введённой цене, ₽": list(actual.values()),
+        "При целевой цене, ₽": [forecast.get(key, 0.0) for key in actual.keys()],
+    })
+    st.dataframe(pnl, use_container_width=True, hide_index=True, height=520, column_config={
+        "При введённой цене, ₽": st.column_config.NumberColumn(format="%.2f"),
+        "При целевой цене, ₽": st.column_config.NumberColumn(format="%.2f"),
+    })
+    st.download_button("Скачать P&L нового товара CSV", pnl.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"), "ozon_new_product_pnl.csv", "text/csv")
+    if not target_reachable:
+        st.error("С такой комиссией, налогами и расходами целевая маржинальность не достигается даже при существенно большей цене. Проверьте тарифы и целевой процент.")
+    st.info("Комиссия, тарифы логистики и налоги задаются как ваши параметры расчёта. Соинвест ограничивает погашение услуг Ozon 99%; расходы на отправления пересчитываются на одну выкупленную единицу. Перед публикацией цены сверьте допущения с тарифами и налоговым режимом продавца.")
+
+
 st.markdown("---")
 with st.sidebar:
     st.header("МойСклад")
@@ -269,6 +534,12 @@ run = st.session_state.get("report_ready", False)
 
 if not uploaded_file:
     st.info("Загрузите XLSX-выгрузку юнит-экономики Ozon, чтобы рассчитать прибыль с исторической себестоимостью из МоегоСклада.")
+    with st.expander("Открыть полный калькулятор нового товара", expanded=True):
+        empty_report = pd.DataFrame({
+            "net_units": pd.Series(dtype=float), "price": pd.Series(dtype=float),
+            "cost_price": pd.Series(dtype=float),
+        })
+        render_full_product_calculator(empty_report)
 elif run:
     if not ms_token:
         st.error("Добавьте токен МоегоСклада в секреты Streamlit или в поле слева.")
@@ -368,8 +639,9 @@ elif run:
                 "ms_name": "Название в МойСклад", "ms_code": "Код в МойСклад",
                 "cost_missing": "Себестоимость не найдена",
             }
-            tab_report, tab_price, tab_new_product = st.tabs([
-                "Юнит-экономика", "Целевая маржинальность", "Калькулятор нового товара",
+            tab_report, tab_price, tab_new_product, tab_full_product = st.tabs([
+                "Юнит-экономика", "Целевая маржинальность", "Быстрый калькулятор",
+                "Полный калькулятор товара",
             ])
             with tab_report:
                 st.subheader("Юнит-экономика по товарам из выгрузки")
@@ -528,12 +800,21 @@ elif run:
                                 "(1 − доля комиссии и эквайринга − целевая маржинальность). "
                                 "Это оценка по выбранной схеме и периоду выгрузки; тарифы, логистика и продвижение нового товара могут отличаться."
                             )
+            with tab_full_product:
+                render_full_product_calculator(report)
         except (RuntimeError, ValueError, requests.RequestException, ImportError) as exc:
             st.error(f"Не удалось обработать файл или загрузить себестоимость: {exc}")
         except Exception as exc:
             st.error(f"При обработке данных возникла непредвиденная ошибка: {exc}")
 else:
     st.info("Файл загружен. Нажмите «Рассчитать по таблице».")
+    with st.expander("Открыть полный калькулятор нового товара", expanded=True):
+        empty_report = pd.DataFrame({
+            "net_units": pd.Series(dtype=float), "price": pd.Series(dtype=float),
+            "cost_price": pd.Series(dtype=float),
+        })
+        render_full_product_calculator(empty_report)
 
 st.markdown("---")
 st.caption("Источник продаж, начислений Ozon, цены и показателей прибыли — загруженная XLSX-выгрузка юнит-экономики. Историческая средневзвешенная себестоимость загружается из проведённых документов «Приёмка» и «Оприходование» в МоемСкладе.")
+
